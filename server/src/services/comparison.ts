@@ -95,7 +95,7 @@ interface InsertedItemRow {
 const activeControllers = new Map<string, AbortController>();
 
 /** Maximum time for the entire comparison pipeline */
-const PIPELINE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const PIPELINE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 class CancellationError extends Error {
   constructor(message = 'Сверка отменена пользователем') {
@@ -385,7 +385,7 @@ export async function startComparison(comparisonId: string): Promise<void> {
       const cancelledRow = getDb().prepare('SELECT cancelled_at FROM comparisons WHERE id = ?').get(comparisonId) as { cancelled_at: string | null } | undefined;
       const isTimeout = err instanceof Error && err.name === 'AbortError' && !cancelledRow?.cancelled_at;
       const message = isTimeout
-        ? 'Превышено максимальное время обработки (5 мин)'
+        ? 'Превышено максимальное время обработки (10 мин)'
         : err instanceof Error ? err.message : String(err);
       console.error(`[comparison] Error for ${comparisonId}:`, message);
 

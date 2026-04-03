@@ -34,7 +34,7 @@ interface OpenRouterResponse {
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2000;
-const LLM_CALL_TIMEOUT_MS = 120_000; // 2 minutes per LLM call
+const LLM_CALL_TIMEOUT_MS = 300_000; // 5 minutes per LLM call
 
 /**
  * Calls the OpenRouter chat completions API.
