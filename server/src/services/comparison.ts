@@ -271,7 +271,7 @@ export async function startComparison(comparisonId: string): Promise<void> {
       totalPrice: item.totalPrice,
     }));
 
-    const BATCH_SIZE = 30;
+    const BATCH_SIZE = 15;
     const orderBatches: CompareItemInput[][] = [];
     for (let i = 0; i < orderForPrompt.length; i += BATCH_SIZE) {
       orderBatches.push(orderForPrompt.slice(i, i + BATCH_SIZE));
@@ -319,7 +319,6 @@ export async function startComparison(comparisonId: string): Promise<void> {
           { role: 'user', content: userMessage },
         ],
         temperature: 0.1,
-        maxTokens: 16000,
         responseFormat: { type: 'json_object' },
         signal: controller.signal,
       });
