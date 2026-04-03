@@ -15,12 +15,14 @@ export interface CallOpenRouterParams {
   model: string;
   messages: ChatMessage[];
   temperature?: number;
+  maxTokens?: number;
   responseFormat?: { type: 'json_object' };
   signal?: AbortSignal;
 }
 
 interface OpenRouterChoice {
   message: { content: string };
+  finish_reason?: string;
 }
 
 interface OpenRouterResponse {
@@ -41,13 +43,17 @@ const LLM_CALL_TIMEOUT_MS = 300_000; // 5 minutes per LLM call
  * Retries up to MAX_RETRIES times on HTTP 429 with exponential backoff.
  */
 export async function callOpenRouter(params: CallOpenRouterParams): Promise<string> {
-  const { model, messages, temperature = 0.1, responseFormat, signal } = params;
+  const { model, messages, temperature = 0.1, maxTokens, responseFormat, signal } = params;
 
   const body: Record<string, unknown> = {
     model,
     messages,
     temperature,
   };
+
+  if (maxTokens) {
+    body.max_tokens = maxTokens;
+  }
 
   if (responseFormat) {
     body.response_format = responseFormat;
@@ -111,15 +117,21 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
       const data = (await response.json()) as OpenRouterResponse;
 
       // --- Log: response received ---
-      const content = data.choices?.[0]?.message?.content;
+      const choice = data.choices?.[0];
+      const content = choice?.message?.content;
+      const finishReason = choice?.finish_reason ?? 'unknown';
       const contentLen = content?.length ?? 0;
       console.log(
         `[llm] ← Response received (${elapsed}s) | ` +
-        `Model: ${model} | Response size: ${contentLen} chars` +
+        `Model: ${model} | Response size: ${contentLen} chars | finish_reason: ${finishReason}` +
         (data.usage
           ? ` | Tokens: prompt=${data.usage.prompt_tokens}, completion=${data.usage.completion_tokens}, total=${data.usage.total_tokens}`
           : '')
       );
+
+      if (finishReason === 'length') {
+        console.warn(`[llm] ⚠ Response TRUNCATED (finish_reason=length) — output hit max_tokens limit`);
+      }
 
       if (!content) {
         throw new Error('OpenRouter returned empty content');
@@ -183,13 +195,22 @@ function estimatePromptSize(messages: ChatMessage[]): number {
   return size;
 }
 
-/** Quick check if a string is valid JSON */
+/** Quick check if a string is valid JSON (after stripping markdown fences) */
 function isValidJson(text: string): boolean {
   let cleaned = text.trim();
-  const fenceMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-  if (fenceMatch) {
-    cleaned = fenceMatch[1]!.trim();
+
+  // Strip closed fence
+  const closedFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)\n\s*```\s*$/);
+  if (closedFence) {
+    cleaned = closedFence[1]!.trim();
+  } else {
+    // Strip unclosed fence (truncated response)
+    const openFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)$/);
+    if (openFence) {
+      cleaned = openFence[1]!.trim();
+    }
   }
+
   try {
     JSON.parse(cleaned);
     return true;

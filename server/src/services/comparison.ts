@@ -284,6 +284,7 @@ export async function startComparison(comparisonId: string): Promise<void> {
         { role: 'user', content: userMessage },
       ],
       temperature: 0.1,
+      maxTokens: 64000,
       responseFormat: { type: 'json_object' },
       signal: controller.signal,
     });
@@ -405,16 +406,33 @@ export async function startComparison(comparisonId: string): Promise<void> {
  * Parses a JSON response that may be wrapped in markdown code fences.
  */
 function parseJsonResponse(text: string): ComparisonLLMResult {
-  let cleaned = text.trim();
-
-  const fenceMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-  if (fenceMatch) {
-    cleaned = fenceMatch[1]!.trim();
-  }
+  const cleaned = stripMarkdownFences(text);
 
   try {
     return JSON.parse(cleaned) as ComparisonLLMResult;
   } catch {
     throw new Error(`Failed to parse LLM comparison response as JSON: ${cleaned.slice(0, 300)}`);
   }
+}
+
+/**
+ * Strips markdown code fences from LLM response.
+ * Handles both closed (```json ... ```) and unclosed (```json ... EOF) fences.
+ */
+function stripMarkdownFences(text: string): string {
+  let cleaned = text.trim();
+
+  // Try closed fence first (greedy to match the last closing ```)
+  const closedFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)\n\s*```\s*$/);
+  if (closedFence) {
+    return closedFence[1]!.trim();
+  }
+
+  // Unclosed fence (response truncated — no closing ```)
+  const openFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)$/);
+  if (openFence) {
+    return openFence[1]!.trim();
+  }
+
+  return cleaned;
 }

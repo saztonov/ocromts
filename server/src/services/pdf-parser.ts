@@ -87,17 +87,31 @@ export async function parsePdf(filePath: string, signal?: AbortSignal): Promise<
  * Attempts to parse a JSON response that may be wrapped in markdown code fences.
  */
 function parseJsonResponse(text: string): PdfExtractionResult {
-  let cleaned = text.trim();
-
-  // Strip markdown code fences if present
-  const fenceMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-  if (fenceMatch) {
-    cleaned = fenceMatch[1]!.trim();
-  }
+  const cleaned = stripMarkdownFences(text);
 
   try {
     return JSON.parse(cleaned) as PdfExtractionResult;
   } catch {
     throw new Error(`Failed to parse PDF extraction response as JSON: ${cleaned.slice(0, 200)}`);
   }
+}
+
+/**
+ * Strips markdown code fences from LLM response.
+ * Handles both closed (```json ... ```) and unclosed (```json ... EOF) fences.
+ */
+function stripMarkdownFences(text: string): string {
+  let cleaned = text.trim();
+
+  const closedFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)\n\s*```\s*$/);
+  if (closedFence) {
+    return closedFence[1]!.trim();
+  }
+
+  const openFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)$/);
+  if (openFence) {
+    return openFence[1]!.trim();
+  }
+
+  return cleaned;
 }
