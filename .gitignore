@@ -141,3 +141,5 @@ vite.config.ts.timestamp-*
 # Project-specific
 uploads/
 *.db
+*.db-shm
+*.db-wal
