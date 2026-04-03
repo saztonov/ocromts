@@ -1,5 +1,5 @@
 export type MatchStatus = 'matched' | 'partial' | 'order_only' | 'invoice_only';
-export type ComparisonStatus = 'pending' | 'parsing' | 'comparing' | 'done' | 'error';
+export type ComparisonStatus = 'pending' | 'parsing' | 'comparing' | 'done' | 'error' | 'cancelled';
 export type QuantityStatus = 'exact' | 'within_tolerance' | 'over' | 'under' | 'incompatible_units';
 
 export interface Comparison {
@@ -9,7 +9,9 @@ export interface Comparison {
   invoice_filename: string;
   invoice_file_type: string;
   status: ComparisonStatus;
+  progress: number;
   error_message: string | null;
+  cancelled_at: string | null;
   created_at: string;
   summary_json: string | null;
 }

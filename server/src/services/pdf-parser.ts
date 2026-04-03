@@ -42,7 +42,7 @@ interface PdfExtractionResult {
  * Parses a PDF invoice by sending it as base64 to a vision-capable LLM
  * and extracting structured material data from the response.
  */
-export async function parsePdf(filePath: string): Promise<ParsedItem[]> {
+export async function parsePdf(filePath: string, signal?: AbortSignal): Promise<ParsedItem[]> {
   const fileBuffer = fs.readFileSync(filePath);
   const base64Pdf = fileBuffer.toString('base64');
 
@@ -58,6 +58,7 @@ export async function parsePdf(filePath: string): Promise<ParsedItem[]> {
     ],
     temperature: 0.05,
     responseFormat: { type: 'json_object' },
+    signal,
   });
 
   const parsed = parseJsonResponse(responseText);

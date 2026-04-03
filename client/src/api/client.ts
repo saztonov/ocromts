@@ -58,6 +58,10 @@ export async function getComparison(id: string): Promise<ComparisonDetail> {
   };
 }
 
+export async function cancelComparison(id: string): Promise<void> {
+  await request<{ success: boolean }>(`/comparisons/${id}/cancel`, { method: 'POST' });
+}
+
 export async function deleteComparison(id: string): Promise<void> {
   await fetch(`${BASE}/comparisons/${id}`, { method: 'DELETE' });
 }

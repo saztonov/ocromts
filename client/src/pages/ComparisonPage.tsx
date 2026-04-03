@@ -1,17 +1,20 @@
 import { useState, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
-import { getComparison } from '../api/client';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { getComparison, cancelComparison } from '../api/client';
 import type { MatchStatus, ComparisonSummary } from '../types';
 import SummaryBar from '../components/comparison/SummaryBar';
 import FilterTabs from '../components/comparison/FilterTabs';
 import ComparisonTable from '../components/comparison/ComparisonTable';
 import Spinner from '../components/ui/Spinner';
 import StatusBadge from '../components/ui/StatusBadge';
+import ProgressBar from '../components/ui/ProgressBar';
 
 export default function ComparisonPage() {
   const { id } = useParams<{ id: string }>();
   const [filter, setFilter] = useState<MatchStatus | 'all'>('all');
+  const [isCancelling, setIsCancelling] = useState(false);
+  const queryClient = useQueryClient();
 
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ['comparison', id],
@@ -19,7 +22,7 @@ export default function ComparisonPage() {
     enabled: !!id,
     refetchInterval: (query) => {
       const status = query.state.data?.comparison.status;
-      if (status && status !== 'done' && status !== 'error') {
+      if (status && !['done', 'error', 'cancelled'].includes(status)) {
         return 2000;
       }
       return false;
@@ -51,6 +54,19 @@ export default function ComparisonPage() {
   }, [results]);
 
   const isPending = comparison?.status === 'pending' || comparison?.status === 'parsing' || comparison?.status === 'comparing';
+
+  const handleCancel = async () => {
+    if (!id) return;
+    setIsCancelling(true);
+    try {
+      await cancelComparison(id);
+      queryClient.invalidateQueries({ queryKey: ['comparison', id] });
+    } catch (e) {
+      console.error('Cancel failed:', e);
+    } finally {
+      setIsCancelling(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -133,16 +149,63 @@ export default function ComparisonPage() {
 
           {/* Processing state */}
           {isPending && (
-            <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-white shadow-sm py-20">
+            <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-white shadow-sm py-12 px-6">
               <Spinner size="lg" />
               <p className="mt-4 text-base font-medium text-slate-700">
                 {comparison.status === 'pending' && 'Ожидание в очереди...'}
                 {comparison.status === 'parsing' && 'Анализ документов...'}
                 {comparison.status === 'comparing' && 'Сравнение позиций...'}
               </p>
-              <p className="mt-1 text-sm text-slate-500">
-                Это может занять некоторое время
-              </p>
+              <div className="mt-4 w-full max-w-xs">
+                <ProgressBar progress={comparison.progress} />
+              </div>
+              <button
+                onClick={handleCancel}
+                disabled={isCancelling}
+                className="mt-5 inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-red-600 hover:text-red-700 border border-red-200 rounded-lg hover:bg-red-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  className="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <path
+                    fillRule="evenodd"
+                    d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z"
+                    clipRule="evenodd"
+                  />
+                </svg>
+                {isCancelling ? 'Отмена...' : 'Остановить сверку'}
+              </button>
+            </div>
+          )}
+
+          {/* Cancelled state */}
+          {comparison.status === 'cancelled' && (
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-6">
+              <div className="flex items-start gap-3">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  className="h-5 w-5 mt-0.5 text-slate-500 shrink-0"
+                  aria-hidden="true"
+                >
+                  <path
+                    fillRule="evenodd"
+                    d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z"
+                    clipRule="evenodd"
+                  />
+                </svg>
+                <div>
+                  <h2 className="text-base font-semibold text-slate-900">Сверка отменена</h2>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Обработка была остановлена пользователем
+                  </p>
+                </div>
+              </div>
             </div>
           )}
 

@@ -5,7 +5,9 @@ CREATE TABLE IF NOT EXISTS comparisons (
     invoice_filename TEXT NOT NULL,
     invoice_file_type TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
+    progress INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
+    cancelled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     summary_json TEXT
 );

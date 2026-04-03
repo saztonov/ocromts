@@ -16,6 +16,7 @@ export interface CallOpenRouterParams {
   messages: ChatMessage[];
   temperature?: number;
   responseFormat?: { type: 'json_object' };
+  signal?: AbortSignal;
 }
 
 interface OpenRouterChoice {
@@ -33,13 +34,14 @@ interface OpenRouterResponse {
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2000;
+const LLM_CALL_TIMEOUT_MS = 120_000; // 2 minutes per LLM call
 
 /**
  * Calls the OpenRouter chat completions API.
  * Retries up to MAX_RETRIES times on HTTP 429 with exponential backoff.
  */
 export async function callOpenRouter(params: CallOpenRouterParams): Promise<string> {
-  const { model, messages, temperature = 0.1, responseFormat } = params;
+  const { model, messages, temperature = 0.1, responseFormat, signal } = params;
 
   const body: Record<string, unknown> = {
     model,
@@ -61,6 +63,12 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
     }
 
     try {
+      // Combine caller's abort signal with per-call timeout
+      const timeoutSignal = AbortSignal.timeout(LLM_CALL_TIMEOUT_MS);
+      const fetchSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
+
       const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -70,6 +78,7 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
           'X-Title': 'OCROMTS - Order vs Invoice Comparison',
         },
         body: JSON.stringify(body),
+        signal: fetchSignal,
       });
 
       if (response.status === 429) {
@@ -101,6 +110,10 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
 
       return content;
     } catch (err) {
+      // If the caller's signal was aborted, stop immediately (user cancel)
+      if (signal?.aborted) {
+        throw err;
+      }
       if (err instanceof Error && err.message.includes('429')) {
         lastError = err;
         continue;

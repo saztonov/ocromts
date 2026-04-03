@@ -39,6 +39,10 @@ const config: Record<Status, { label: string; classes: string }> = {
     label: 'В очереди',
     classes: 'bg-slate-50 text-slate-600 border border-slate-200',
   },
+  cancelled: {
+    label: 'Отменено',
+    classes: 'bg-slate-50 text-slate-600 border border-slate-200',
+  },
 };
 
 interface StatusBadgeProps {

@@ -77,7 +77,9 @@ interface ComparisonRow {
   invoice_filename: string;
   invoice_file_type: string;
   status: string;
+  progress: number;
   error_message: string | null;
+  cancelled_at: string | null;
   created_at: string;
   summary_json: string | null;
 }
@@ -85,6 +87,53 @@ interface ComparisonRow {
 interface InsertedItemRow {
   id: number;
   position: number;
+}
+
+// ---- Cancellation & progress infrastructure ---- //
+
+/** In-memory map of active comparison AbortControllers */
+const activeControllers = new Map<string, AbortController>();
+
+/** Maximum time for the entire comparison pipeline */
+const PIPELINE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+class CancellationError extends Error {
+  constructor(message = 'Сверка отменена пользователем') {
+    super(message);
+    this.name = 'CancellationError';
+  }
+}
+
+/** Update both status and progress in one DB call */
+function updateProgress(comparisonId: string, status: string, progress: number): void {
+  getDb().prepare('UPDATE comparisons SET status = ?, progress = ? WHERE id = ?')
+    .run(status, progress, comparisonId);
+}
+
+/** Check if comparison was cancelled; throw CancellationError if so */
+function checkCancelled(comparisonId: string): void {
+  const row = getDb().prepare('SELECT cancelled_at FROM comparisons WHERE id = ?')
+    .get(comparisonId) as { cancelled_at: string | null } | undefined;
+  if (row?.cancelled_at) {
+    throw new CancellationError();
+  }
+}
+
+/**
+ * Cancel a running comparison. Sets DB flag and aborts in-flight requests.
+ * Returns true if the comparison was successfully cancelled.
+ */
+export function cancelComparison(comparisonId: string): boolean {
+  const result = getDb().prepare(
+    "UPDATE comparisons SET cancelled_at = datetime('now'), status = 'cancelled', progress = 0, error_message = 'Отменено пользователем' WHERE id = ? AND status NOT IN ('done', 'error', 'cancelled')"
+  ).run(comparisonId);
+
+  const controller = activeControllers.get(comparisonId);
+  if (controller) {
+    controller.abort();
+  }
+
+  return result.changes > 0;
 }
 
 // ---- Main orchestration ---- //
@@ -99,13 +148,22 @@ interface InsertedItemRow {
  * 3. Save parsed items to DB
  * 4. Send both item lists to LLM for normalization + comparison
  * 5. Save comparison results to DB
+ *
+ * Supports: progress tracking (0-100%), cancellation, and pipeline timeout.
  */
 export async function startComparison(comparisonId: string): Promise<void> {
   const db = getDb();
+  const controller = new AbortController();
+  activeControllers.set(comparisonId, controller);
+
+  // Pipeline timeout — abort if total time exceeds limit
+  const timeoutHandle = setTimeout(() => {
+    controller.abort();
+  }, PIPELINE_TIMEOUT_MS);
 
   try {
     // ---------- Step 1: Update status ----------
-    updateStatus(comparisonId, 'parsing');
+    updateProgress(comparisonId, 'parsing', 5);
 
     const comparison = db.prepare('SELECT * FROM comparisons WHERE id = ?').get(comparisonId) as ComparisonRow | undefined;
     if (!comparison) {
@@ -117,6 +175,7 @@ export async function startComparison(comparisonId: string): Promise<void> {
     const invoiceFilePath = path.join(uploadsDir, comparison.invoice_filename);
 
     // ---------- Step 2: Parse order (always Excel) ----------
+    checkCancelled(comparisonId);
     console.log(`[comparison] Parsing order file: ${comparison.order_filename}`);
     const orderItems = parseExcel(orderFilePath);
     console.log(`[comparison] Parsed ${orderItems.length} order items`);
@@ -125,11 +184,14 @@ export async function startComparison(comparisonId: string): Promise<void> {
       throw new Error('No items found in order file. Check the Excel format.');
     }
 
+    updateProgress(comparisonId, 'parsing', 15);
+
     // ---------- Step 3: Parse invoice ----------
+    checkCancelled(comparisonId);
     console.log(`[comparison] Parsing invoice file: ${comparison.invoice_filename} (${comparison.invoice_file_type})`);
     let invoiceItems;
     if (comparison.invoice_file_type === 'pdf') {
-      invoiceItems = await parsePdf(invoiceFilePath);
+      invoiceItems = await parsePdf(invoiceFilePath, controller.signal);
     } else {
       invoiceItems = parseExcel(invoiceFilePath);
     }
@@ -139,7 +201,11 @@ export async function startComparison(comparisonId: string): Promise<void> {
       throw new Error('No items found in invoice file. Check the file format.');
     }
 
+    updateProgress(comparisonId, 'parsing', 35);
+
     // ---------- Step 4: Save parsed items to DB ----------
+    checkCancelled(comparisonId);
+
     const insertOrderItem = db.prepare(`
       INSERT INTO order_items (comparison_id, position, raw_name, quantity, unit)
       VALUES (?, ?, ?, ?, ?)
@@ -184,8 +250,10 @@ export async function startComparison(comparisonId: string): Promise<void> {
     });
     insertInvoiceItems();
 
+    updateProgress(comparisonId, 'comparing', 40);
+
     // ---------- Step 5: LLM comparison ----------
-    updateStatus(comparisonId, 'comparing');
+    checkCancelled(comparisonId);
 
     const orderForPrompt: CompareItemInput[] = orderItems.map((item) => ({
       position: item.position,
@@ -207,6 +275,8 @@ export async function startComparison(comparisonId: string): Promise<void> {
 
     console.log(`[comparison] Sending ${orderItems.length} order + ${invoiceItems.length} invoice items to LLM`);
 
+    updateProgress(comparisonId, 'comparing', 45);
+
     const llmResponse = await callOpenRouter({
       model: config.OPENROUTER_MODEL_COMPARE,
       messages: [
@@ -215,7 +285,12 @@ export async function startComparison(comparisonId: string): Promise<void> {
       ],
       temperature: 0.1,
       responseFormat: { type: 'json_object' },
+      signal: controller.signal,
     });
+
+    updateProgress(comparisonId, 'comparing', 90);
+
+    checkCancelled(comparisonId);
 
     const comparisonResult = parseJsonResponse(llmResponse);
 
@@ -291,29 +366,39 @@ export async function startComparison(comparisonId: string): Promise<void> {
     });
     saveResults();
 
+    updateProgress(comparisonId, 'done', 95);
+
     // ---------- Step 7: Save summary and mark done ----------
-    db.prepare('UPDATE comparisons SET summary_json = ?, status = ? WHERE id = ?').run(
+    db.prepare('UPDATE comparisons SET summary_json = ?, status = ?, progress = ? WHERE id = ?').run(
       JSON.stringify(comparisonResult.summary ?? {}),
       'done',
+      100,
       comparisonId
     );
 
     console.log(`[comparison] Completed comparison ${comparisonId}`);
 
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[comparison] Error for ${comparisonId}:`, message);
+    if (err instanceof CancellationError) {
+      console.log(`[comparison] Cancelled: ${comparisonId}`);
+    } else {
+      const cancelledRow = getDb().prepare('SELECT cancelled_at FROM comparisons WHERE id = ?').get(comparisonId) as { cancelled_at: string | null } | undefined;
+      const isTimeout = err instanceof Error && err.name === 'AbortError' && !cancelledRow?.cancelled_at;
+      const message = isTimeout
+        ? 'Превышено максимальное время обработки (5 мин)'
+        : err instanceof Error ? err.message : String(err);
+      console.error(`[comparison] Error for ${comparisonId}:`, message);
 
-    db.prepare('UPDATE comparisons SET status = ?, error_message = ? WHERE id = ?').run(
-      'error',
-      message,
-      comparisonId
-    );
+      db.prepare('UPDATE comparisons SET status = ?, error_message = ? WHERE id = ?').run(
+        'error',
+        message,
+        comparisonId
+      );
+    }
+  } finally {
+    clearTimeout(timeoutHandle);
+    activeControllers.delete(comparisonId);
   }
-}
-
-function updateStatus(comparisonId: string, status: string): void {
-  getDb().prepare('UPDATE comparisons SET status = ? WHERE id = ?').run(status, comparisonId);
 }
 
 /**

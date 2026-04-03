@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getDb } from '../db/connection.js';
 import { config } from '../config.js';
-import { startComparison } from '../services/comparison.js';
+import { startComparison, cancelComparison } from '../services/comparison.js';
 
 // ---- DB row types ---- //
 
@@ -194,6 +194,20 @@ router.get('/:id', (req: Request, res: Response): void => {
     invoice_items: parsedInvoiceItems,
     comparison_results: parsedResults,
   });
+});
+
+/**
+ * POST /api/comparisons/:id/cancel
+ * Cancel an in-progress comparison.
+ */
+router.post('/:id/cancel', (req: Request, res: Response): void => {
+  const id = req.params.id as string;
+  const cancelled = cancelComparison(id);
+  if (cancelled) {
+    res.json({ success: true });
+  } else {
+    res.status(409).json({ error: 'Сверку невозможно отменить (уже завершена или не найдена)' });
+  }
 });
 
 /**
