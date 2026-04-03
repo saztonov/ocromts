@@ -40,7 +40,22 @@ export async function getComparisons(): Promise<Comparison[]> {
 }
 
 export async function getComparison(id: string): Promise<ComparisonDetail> {
-  return request<ComparisonDetail>(`/comparisons/${id}`);
+  const raw = await request<Record<string, unknown>>(`/comparisons/${id}`);
+
+  // Backend returns a flat object; reshape to match ComparisonDetail
+  const { order_items, invoice_items, comparison_results, ...rest } = raw as {
+    order_items: ComparisonDetail['orderItems'];
+    invoice_items: ComparisonDetail['invoiceItems'];
+    comparison_results: ComparisonDetail['results'];
+    [key: string]: unknown;
+  };
+
+  return {
+    comparison: rest as unknown as ComparisonDetail['comparison'],
+    orderItems: order_items ?? [],
+    invoiceItems: invoice_items ?? [],
+    results: comparison_results ?? [],
+  };
 }
 
 export async function deleteComparison(id: string): Promise<void> {
