@@ -43,7 +43,8 @@ const storage = multer.diskStorage({
   },
   filename(_req, file, cb) {
     // Preserve the original filename (sanitize only null bytes)
-    const safeName = file.originalname.replace(/\0/g, '');
+    const decoded = Buffer.from(file.originalname, 'latin1').toString('utf8');
+    const safeName = decoded.replace(/\0/g, '');
     cb(null, safeName);
   },
 });
@@ -87,7 +88,7 @@ app.use('/api/comparisons', (req, res, next) => {
       }
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const fieldNames = files ? Object.keys(files) : [];
-      console.log(`[upload] Received files: ${fieldNames.map(f => `${f} (${files![f][0]?.originalname})`).join(', ')}`);
+      console.log(`[upload] Received files: ${fieldNames.map(f => `${f} (${Buffer.from(files![f][0]?.originalname ?? '', 'latin1').toString('utf8')})`).join(', ')}`);
       next();
     });
   } else {
