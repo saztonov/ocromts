@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "c:/Users/Usr/claudeprojects/ocromts/AGENTS"]
+    },
+    "excel": {
+      "command": "npx",
+      "args": ["-y", "@negokaz/excel-mcp-server"]
+    }
+  },
+  "permissions": {
+    "allow": [
+      "mcp__filesystem__read_file",
+      "mcp__filesystem__list_directory",
+      "mcp__filesystem__write_file",
+      "mcp__excel__*"
+    ]
+  }
+}

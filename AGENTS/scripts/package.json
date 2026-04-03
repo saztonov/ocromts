@@ -1,0 +1,8 @@
+{
+  "name": "agents-scripts",
+  "private": true,
+  "description": "Скрипты экспорта отчётов сверки (JSON → Excel, JSON → Markdown)",
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
