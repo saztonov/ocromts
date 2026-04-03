@@ -12,8 +12,8 @@ export default function UploadForm({ onSubmit }: UploadFormProps) {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const order = useFileUpload(['.xlsx']);
-  const invoice = useFileUpload(['.pdf', '.xlsx']);
+  const order = useFileUpload(['.xlsx', '.xls']);
+  const invoice = useFileUpload(['.pdf', '.xlsx', '.xls']);
 
   const canSubmit = order.file !== null && invoice.file !== null && !submitting;
 
