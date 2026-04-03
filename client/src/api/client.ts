@@ -24,8 +24,8 @@ export async function createComparison(
   name?: string,
 ): Promise<{ id: string }> {
   const form = new FormData();
-  form.append('order', orderFile);
-  form.append('invoice', invoiceFile);
+  form.append('orderFile', orderFile);
+  form.append('invoiceFile', invoiceFile);
   if (name?.trim()) {
     form.append('name', name.trim());
   }

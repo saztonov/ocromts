@@ -76,13 +76,18 @@ app.use('/api/comparisons', (req, res, next) => {
   if (req.method === 'POST' && req.path === '/') {
     uploadFields(req, res, (err) => {
       if (err instanceof multer.MulterError) {
+        console.error(`[upload] Multer error: ${err.message}, field: ${err.field}`);
         res.status(400).json({ error: `Upload error: ${err.message}` });
         return;
       }
       if (err) {
+        console.error(`[upload] Error:`, (err as Error).message);
         res.status(400).json({ error: (err as Error).message });
         return;
       }
+      const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+      const fieldNames = files ? Object.keys(files) : [];
+      console.log(`[upload] Received files: ${fieldNames.map(f => `${f} (${files![f][0]?.originalname})`).join(', ')}`);
       next();
     });
   } else {
