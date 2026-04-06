@@ -72,21 +72,22 @@ export const PDF_EXTRACTION_SYSTEM_PROMPT = `Ты — специализиров
 
 /**
  * Builds the user message content for PDF extraction.
- * PDF передаётся через content-part типа `file` (OpenRouter PDF inputs),
- * а не через `image_url`, который предназначен для картинок.
+ * PDF рендерится локально постранично в PNG и передаётся как массив `image_url`
+ * content-частей. Такой формат поддерживают все vision-модели (включая qwen-vision),
+ * в отличие от `type: 'file'`, которое работает только у Gemini/Claude.
  */
-export function buildPdfExtractionUserContent(base64Pdf: string): MessageContentPart[] {
-  return [
+export function buildPdfImagesUserContent(pageImagesBase64: string[]): MessageContentPart[] {
+  const parts: MessageContentPart[] = [
     {
       type: 'text',
-      text: 'Извлеки все позиции материалов из этого документа. Ответь строго в JSON формате.',
-    },
-    {
-      type: 'file',
-      file: {
-        filename: 'invoice.pdf',
-        file_data: `data:application/pdf;base64,${base64Pdf}`,
-      },
+      text: 'Ниже — страницы документа в виде изображений. Извлеки все позиции материалов из таблиц. Ответь строго в JSON формате.',
     },
   ];
+  for (const b64 of pageImagesBase64) {
+    parts.push({
+      type: 'image_url',
+      image_url: { url: `data:image/png;base64,${b64}` },
+    });
+  }
+  return parts;
 }

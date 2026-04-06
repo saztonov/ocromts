@@ -1,10 +1,10 @@
-import fs from 'node:fs';
+import { pdf } from 'pdf-to-img';
 import { callOpenRouter } from './llm.js';
 import { normalizeUnit } from './unit-converter.js';
 import { config } from '../config.js';
 import {
   PDF_EXTRACTION_SYSTEM_PROMPT,
-  buildPdfExtractionUserContent,
+  buildPdfImagesUserContent,
 } from '../prompts/extract-pdf.js';
 
 export interface ParsedItem {
@@ -43,12 +43,27 @@ interface PdfExtractionResult {
  * and extracting structured material data from the response.
  */
 export async function parsePdf(filePath: string, signal?: AbortSignal): Promise<ParsedItem[]> {
-  const fileBuffer = fs.readFileSync(filePath);
-  const base64Pdf = fileBuffer.toString('base64');
+  // Рендерим каждую страницу PDF в PNG локально. scale: 2 ≈ 144 DPI — баланс
+  // читаемости таблиц и размера изображения.
+  const document = await pdf(filePath, { scale: 2 });
+  const pageImages: string[] = [];
+  for await (const pageBuffer of document) {
+    pageImages.push(pageBuffer.toString('base64'));
+  }
 
-  console.log(`[pdf-parser] Sending PDF (${Math.round(fileBuffer.length / 1024)}KB) to vision model`);
+  if (pageImages.length === 0) {
+    throw new Error('PDF has no pages to render');
+  }
 
-  const userContent = buildPdfExtractionUserContent(base64Pdf);
+  const totalSize = pageImages.reduce((s, b) => s + b.length, 0);
+  console.log(
+    `[pdf-parser] Rendered ${pageImages.length} pages to PNG (total ${Math.round(totalSize / 1024)}KB base64)`
+  );
+  if (pageImages.length > 20) {
+    console.warn(`[pdf-parser] PDF has ${pageImages.length} pages — request may be slow`);
+  }
+
+  const userContent = buildPdfImagesUserContent(pageImages);
 
   const responseText = await callOpenRouter({
     model: config.OPENROUTER_MODEL_VISION,

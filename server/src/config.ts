@@ -15,6 +15,7 @@ export interface AppConfig {
   OPENROUTER_MODEL_COMPARE: string;
   UPLOADS_DIR: string;
   DB_PATH: string;
+  LLM_CALL_TIMEOUT_MS: number;
 }
 
 export const config: AppConfig = {
@@ -24,4 +25,5 @@ export const config: AppConfig = {
   OPENROUTER_MODEL_COMPARE: process.env.OPENROUTER_MODEL_COMPARE ?? 'anthropic/claude-sonnet-4',
   UPLOADS_DIR: path.resolve(__dirname, '../../uploads'),
   DB_PATH: path.resolve(__dirname, '../../data.db'),
+  LLM_CALL_TIMEOUT_MS: Number(process.env.LLM_CALL_TIMEOUT_MS ?? 600_000),
 };

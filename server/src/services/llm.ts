@@ -36,7 +36,7 @@ interface OpenRouterResponse {
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2000;
-const LLM_CALL_TIMEOUT_MS = 300_000; // 5 minutes per LLM call
+const LLM_CALL_TIMEOUT_MS = config.LLM_CALL_TIMEOUT_MS;
 
 /**
  * Calls the OpenRouter chat completions API.
@@ -161,6 +161,8 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
       }
       if (err instanceof Error && err.name === 'TimeoutError') {
         console.error(`[llm] ← Timeout after ${elapsed}s (limit: ${LLM_CALL_TIMEOUT_MS / 1000}s)`);
+        lastError = err;
+        if (attempt < 1) continue; // один повтор по таймауту, дальше — fail
         throw err;
       }
       if (err instanceof Error && err.message.includes('429')) {
