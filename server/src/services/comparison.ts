@@ -5,6 +5,9 @@ import { parseExcel } from './excel-parser.js';
 import { parsePdf } from './pdf-parser.js';
 import { callOpenRouter } from './llm.js';
 import { buildComparePrompt, type CompareItemInput } from '../prompts/compare.js';
+import { extractParameters } from './parameter-extractor.js';
+import type { ExtractedItem } from '../prompts/extract-params.js';
+import { compareItems, type CompareDecision } from './parameter-comparator.js';
 
 // ---- Types for the LLM comparison response ---- //
 
@@ -250,7 +253,51 @@ export async function startComparison(comparisonId: string): Promise<void> {
     });
     insertInvoiceItems();
 
-    updateProgress(comparisonId, 'comparing', 40);
+    updateProgress(comparisonId, 'comparing', 38);
+
+    // ---------- Step 4.5: Stage A — Extract structured parameters ----------
+    checkCancelled(comparisonId);
+    console.log(`[comparison] Stage A: extracting structured parameters...`);
+
+    const orderExtracted = await extractParameters(
+      orderItems.map((it) => ({
+        position: it.position,
+        rawName: it.rawName,
+        unit: it.unit,
+        quantity: it.quantity,
+      })),
+      controller.signal,
+      'order'
+    );
+
+    updateProgress(comparisonId, 'comparing', 42);
+
+    const invoiceExtracted = await extractParameters(
+      invoiceItems.map((it) => ({
+        position: it.position,
+        rawName: it.rawName,
+        unit: it.unit,
+        quantity: it.quantity,
+      })),
+      controller.signal,
+      'invoice'
+    );
+
+    // Persist extracted params (material_type, gost, params_json) into DB.
+    persistExtractedParams(db, 'order_items', orderPositionToId, orderExtracted);
+    persistExtractedParams(db, 'invoice_items', invoicePositionToId, invoiceExtracted);
+
+    // Build position → ExtractedItem maps for later use in comparator.
+    const orderParamsByPos = new Map<number, ExtractedItem>();
+    for (const e of orderExtracted) orderParamsByPos.set(e.position, e);
+    const invoiceParamsByPos = new Map<number, ExtractedItem>();
+    for (const e of invoiceExtracted) invoiceParamsByPos.set(e.position, e);
+
+    console.log(
+      `[comparison] Stage A done: ${orderExtracted.length} order params, ${invoiceExtracted.length} invoice params`
+    );
+
+    updateProgress(comparisonId, 'comparing', 45);
 
     // ---------- Step 5: LLM comparison (batched) ----------
     checkCancelled(comparisonId);
@@ -260,6 +307,7 @@ export async function startComparison(comparisonId: string): Promise<void> {
       rawName: item.rawName,
       unit: item.unit,
       quantity: item.quantity,
+      params: orderParamsByPos.get(item.position) ?? emptyExtracted(item.position),
     }));
 
     const invoiceForPrompt: CompareItemInput[] = invoiceItems.map((item) => ({
@@ -269,6 +317,7 @@ export async function startComparison(comparisonId: string): Promise<void> {
       quantity: item.quantity,
       unitPrice: item.unitPrice,
       totalPrice: item.totalPrice,
+      params: invoiceParamsByPos.get(item.position) ?? emptyExtracted(item.position),
     }));
 
     const BATCH_SIZE = 15;
@@ -281,8 +330,6 @@ export async function startComparison(comparisonId: string): Promise<void> {
       `[comparison] Splitting ${orderItems.length} order items into ${orderBatches.length} batch(es) ` +
       `(batch size: ${BATCH_SIZE}) against ${invoiceItems.length} invoice items`
     );
-
-    updateProgress(comparisonId, 'comparing', 45);
 
     // Accumulate results from all batches
     const mergedResult: ComparisonLLMResult = {
@@ -359,28 +406,93 @@ export async function startComparison(comparisonId: string): Promise<void> {
       }
     }
 
-    // Rebuild summary from merged data
+    // ---------- Step 5.5: Stage B — Deterministic comparison ----------
+    // Walk through every LLM-suggested matched pair, run deterministic comparator
+    // on the structured params. Reject pairs where category/shape doesn't fit;
+    // override parameter_mismatches and confidence with deterministic results.
+    updateProgress(comparisonId, 'comparing', 88);
+    console.log(`[comparison] Stage B: deterministic comparison of ${mergedResult.matched_items.length} pairs`);
+
+    const decisions = new Map<number, CompareDecision>(); // key: order_row
+    const survivors: typeof mergedResult.matched_items = [];
+
+    for (const match of mergedResult.matched_items) {
+      const orderParams = orderParamsByPos.get(match.order_row);
+      const invoiceParams = invoiceParamsByPos.get(match.invoice_row);
+      if (!orderParams || !invoiceParams) {
+        // No params extracted — keep LLM verdict as-is, no override.
+        survivors.push(match);
+        continue;
+      }
+
+      const decision = compareItems(orderParams, invoiceParams);
+
+      if (!decision.isMatch) {
+        // Reject: move both sides back to unmatched.
+        const orderItem = orderItems.find((it) => it.position === match.order_row);
+        const invoiceItem = invoiceItems.find((it) => it.position === match.invoice_row);
+        const reason = decision.rejectReason ?? 'Параметры не совпадают';
+        if (orderItem) {
+          mergedResult.unmatched_order.push({
+            order_row: orderItem.position,
+            order_name: orderItem.rawName,
+            reason: `Stage B: ${reason}`,
+          });
+        }
+        if (invoiceItem) {
+          mergedResult.unmatched_invoice.push({
+            invoice_row: invoiceItem.position,
+            invoice_name: invoiceItem.rawName,
+            reason: `Stage B: ${reason}`,
+          });
+        }
+        console.log(`[comparison] Stage B reject: order#${match.order_row} ↔ invoice#${match.invoice_row} — ${reason}`);
+        continue;
+      }
+
+      // Override LLM-supplied mismatches/confidence with deterministic results.
+      match.parameter_mismatches = decision.mismatches.map((m) => ({
+        parameter: m.parameter,
+        order_value: m.order_value,
+        invoice_value: m.invoice_value,
+        severity: m.severity,
+      }));
+      match.match_confidence = decision.confidence;
+
+      decisions.set(match.order_row, decision);
+      survivors.push(match);
+    }
+
+    mergedResult.matched_items = survivors;
+
+    // Rebuild summary: counts are number of PAIRS in each status, not raw mismatch counts.
+    // This way the summary cards in the UI align 1-to-1 with status badges.
+    const statusBreakdown = { matched: 0, partial: 0, mismatch: 0 };
+    for (const m of mergedResult.matched_items) {
+      const d = decisions.get(m.order_row);
+      if (d) statusBreakdown[d.derivedStatus]++;
+      else statusBreakdown.matched++; // fallback for pairs without params
+    }
+
     mergedResult.summary = {
       total_order: orderForPrompt.length,
       total_invoice: invoiceForPrompt.length,
-      matched: mergedResult.matched_items.length,
+      matched: statusBreakdown.matched,
       unmatched_order: mergedResult.unmatched_order.length,
       unmatched_invoice: mergedResult.unmatched_invoice.length,
-      critical_mismatches: mergedResult.matched_items.reduce(
-        (acc, m) => acc + (m.parameter_mismatches?.filter((p) => p.severity === 'critical').length ?? 0), 0
-      ),
-      warnings: mergedResult.matched_items.reduce(
-        (acc, m) => acc + (m.parameter_mismatches?.filter((p) => p.severity === 'warning').length ?? 0), 0
-      ),
+      critical_mismatches: statusBreakdown.mismatch,
+      warnings: statusBreakdown.partial,
     };
 
     console.log(
-      `[comparison] All batches done: ${mergedResult.summary.matched} matched, ` +
+      `[comparison] All batches done: ${mergedResult.summary.matched} pairs ` +
+      `(${statusBreakdown.matched} matched / ${statusBreakdown.partial} partial / ${statusBreakdown.mismatch} mismatch), ` +
       `${mergedResult.summary.unmatched_order} unmatched order, ` +
       `${mergedResult.summary.unmatched_invoice} unmatched invoice`
     );
 
     const comparisonResult = mergedResult;
+    const finalDecisions = decisions;
 
     // ---------- Step 6: Save results ----------
     const insertResult = db.prepare(`
@@ -402,11 +514,16 @@ export async function startComparison(comparisonId: string): Promise<void> {
           ? JSON.stringify(match.parameter_mismatches)
           : null;
 
+        // Status is derived from severity of deterministic mismatches.
+        // Fallback to 'matched' for pairs that bypassed Stage B (no params extracted).
+        const decision = finalDecisions.get(match.order_row);
+        const matchStatus = decision?.derivedStatus ?? 'matched';
+
         insertResult.run(
           comparisonId,
           orderItemId,
           invoiceItemId,
-          'matched',
+          matchStatus,
           match.match_confidence,
           match.quantity_comparison?.status ?? null,
           match.quantity_comparison?.difference_pct ?? null,
@@ -522,4 +639,57 @@ function stripMarkdownFences(text: string): string {
   }
 
   return cleaned;
+}
+
+// ─── Stage A helpers ─────────────────────────────────────────────────────────
+
+/** Возвращает пустой ExtractedItem-плейсхолдер для позиции (fallback). */
+function emptyExtracted(position: number): ExtractedItem {
+  return {
+    position,
+    category: 'other',
+    type: null,
+    shape: null,
+    geometry: {},
+    material: {},
+    standards: {},
+    extra: {},
+  };
+}
+
+/**
+ * Сохраняет извлечённые параметры в БД (поля material_type, gost, params_json).
+ * Эти поля уже существуют в schema.sql, но раньше не заполнялись.
+ */
+function persistExtractedParams(
+  db: ReturnType<typeof getDb>,
+  table: 'order_items' | 'invoice_items',
+  positionToId: Map<number, number>,
+  extracted: ExtractedItem[]
+): void {
+  const update = db.prepare(
+    `UPDATE ${table} SET material_type = ?, gost = ?, params_json = ? WHERE id = ?`
+  );
+
+  const tx = db.transaction(() => {
+    for (const item of extracted) {
+      const id = positionToId.get(item.position);
+      if (id == null) continue;
+      const materialType = item.type ?? item.category ?? null;
+      const gost = pickGost(item);
+      update.run(materialType, gost, JSON.stringify(item), id);
+    }
+  });
+  tx();
+}
+
+/** Извлекает значение ГОСТ/ТУ из standards для отдельной колонки. */
+function pickGost(item: ExtractedItem): string | null {
+  const std = item.standards ?? {};
+  const candidates = ['gost', 'tu', 'sto'];
+  for (const key of candidates) {
+    const v = std[key];
+    if (v != null && v !== '') return String(v);
+  }
+  return null;
 }

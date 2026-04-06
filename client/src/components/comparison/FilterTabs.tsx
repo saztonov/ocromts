@@ -17,8 +17,9 @@ const tabs: Tab[] = [
   { value: 'all', label: 'Все' },
   { value: 'matched', label: 'Совпадения' },
   { value: 'partial', label: 'Частичные' },
-  { value: 'order_only', label: 'Нет в счёте' },
-  { value: 'invoice_only', label: 'Лишние' },
+  { value: 'mismatch', label: 'Расхождения' },
+  { value: 'unmatched_order', label: 'Нет в счёте' },
+  { value: 'unmatched_invoice', label: 'Лишние' },
 ];
 
 export default function FilterTabs({ activeFilter, onFilterChange, counts }: FilterTabsProps) {

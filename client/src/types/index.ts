@@ -1,6 +1,26 @@
-export type MatchStatus = 'matched' | 'partial' | 'order_only' | 'invoice_only';
+export type MatchStatus =
+  | 'matched'
+  | 'partial'
+  | 'mismatch'
+  | 'unmatched_order'
+  | 'unmatched_invoice'
+  // Legacy aliases (kept for backwards compatibility with old DB rows / filters)
+  | 'order_only'
+  | 'invoice_only';
 export type ComparisonStatus = 'pending' | 'parsing' | 'comparing' | 'done' | 'error' | 'cancelled';
 export type QuantityStatus = 'exact' | 'within_tolerance' | 'over' | 'under' | 'incompatible_units';
+
+/** Структурированные параметры одной позиции (Stage A: parameter-extractor). */
+export interface ItemParams {
+  position?: number;
+  category: string;
+  type?: string | null;
+  shape?: 'round' | 'rectangular' | 'square' | null;
+  geometry?: Record<string, number | string | null>;
+  material?: Record<string, number | string | null>;
+  standards?: Record<string, number | string | null>;
+  extra?: Record<string, number | string | null>;
+}
 
 export interface Comparison {
   id: string;
@@ -32,7 +52,8 @@ export interface OrderItem {
   raw_name: string;
   material_type: string | null;
   gost: string | null;
-  params_json: string | null;
+  /** Server pre-parses params_json into ItemParams object (see routes/comparisons.ts). */
+  params_json: ItemParams | null;
   quantity: number;
   unit: string;
 }

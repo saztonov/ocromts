@@ -20,10 +20,16 @@ export default function SummaryBar({ summary }: SummaryBarProps) {
       stripColor: 'bg-emerald-500',
     },
     {
-      label: 'Частичное совпадение',
+      label: 'Частичные',
       value: summary.warnings,
       color: 'text-amber-700',
       stripColor: 'bg-amber-500',
+    },
+    {
+      label: 'Расхождения',
+      value: summary.critical_mismatches,
+      color: 'text-red-700',
+      stripColor: 'bg-red-500',
     },
     {
       label: 'Нет в счёте',
@@ -40,7 +46,7 @@ export default function SummaryBar({ summary }: SummaryBarProps) {
   ];
 
   return (
-    <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+    <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
       {cards.map((card) => (
         <div
           key={card.label}
