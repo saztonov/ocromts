@@ -63,5 +63,5 @@ export async function cancelComparison(id: string): Promise<void> {
 }
 
 export async function deleteComparison(id: string): Promise<void> {
-  await fetch(`${BASE}/comparisons/${id}`, { method: 'DELETE' });
+  await request<{ success: boolean }>(`/comparisons/${id}`, { method: 'DELETE' });
 }

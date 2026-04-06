@@ -11,9 +11,13 @@
   },
   "permissions": {
     "allow": [
-      "mcp__filesystem__read_file",
-      "mcp__filesystem__list_directory",
-      "mcp__filesystem__write_file",
+      "Bash(*)",
+      "Read",
+      "Write",
+      "Edit",
+      "mcp__supabase__*",
+      "mcp__filesystem__*",
+      "mcp__fetch__*",
       "mcp__excel__*"
     ]
   }
