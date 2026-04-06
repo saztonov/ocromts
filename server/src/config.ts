@@ -16,6 +16,7 @@ export interface AppConfig {
   UPLOADS_DIR: string;
   DB_PATH: string;
   LLM_CALL_TIMEOUT_MS: number;
+  PIPELINE_TIMEOUT_MS: number;
 }
 
 export const config: AppConfig = {
@@ -26,4 +27,5 @@ export const config: AppConfig = {
   UPLOADS_DIR: path.resolve(__dirname, '../../uploads'),
   DB_PATH: path.resolve(__dirname, '../../data.db'),
   LLM_CALL_TIMEOUT_MS: Number(process.env.LLM_CALL_TIMEOUT_MS ?? 600_000),
+  PIPELINE_TIMEOUT_MS: Number(process.env.PIPELINE_TIMEOUT_MS ?? 30 * 60 * 1000),
 };
