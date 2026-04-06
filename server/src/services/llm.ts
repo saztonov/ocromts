@@ -9,7 +9,7 @@ export interface ChatMessage {
 export type MessageContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string } }
-  | { type: 'file'; file: { filename: string; content: string } };
+  | { type: 'file'; file: { filename: string; file_data: string } };
 
 export interface CallOpenRouterParams {
   model: string;
@@ -134,6 +134,7 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
       }
 
       if (!content) {
+        console.error(`[llm] Empty content. Raw response: ${JSON.stringify(data).slice(0, 500)}`);
         throw new Error('OpenRouter returned empty content');
       }
 
@@ -185,7 +186,7 @@ function estimatePromptSize(messages: ChatMessage[]): number {
         if (part.type === 'text') {
           size += part.text.length;
         } else if (part.type === 'file') {
-          size += part.file.content.length;
+          size += part.file.file_data.length;
         } else if (part.type === 'image_url') {
           size += part.image_url.url.length;
         }

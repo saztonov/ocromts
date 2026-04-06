@@ -1,3 +1,5 @@
+import type { MessageContentPart } from '../services/llm.js';
+
 /**
  * System prompt for extracting structured data from PDF invoices/waybills.
  * Used with a vision-capable model (e.g. Gemini) that receives the PDF as base64.
@@ -70,20 +72,20 @@ export const PDF_EXTRACTION_SYSTEM_PROMPT = `Ты — специализиров
 
 /**
  * Builds the user message content for PDF extraction.
- * The PDF is sent as a data URL so vision models can read it.
+ * PDF передаётся через content-part типа `file` (OpenRouter PDF inputs),
+ * а не через `image_url`, который предназначен для картинок.
  */
-export function buildPdfExtractionUserContent(base64Pdf: string): Array<
-  { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
-> {
+export function buildPdfExtractionUserContent(base64Pdf: string): MessageContentPart[] {
   return [
     {
       type: 'text',
       text: 'Извлеки все позиции материалов из этого документа. Ответь строго в JSON формате.',
     },
     {
-      type: 'image_url',
-      image_url: {
-        url: `data:application/pdf;base64,${base64Pdf}`,
+      type: 'file',
+      file: {
+        filename: 'invoice.pdf',
+        file_data: `data:application/pdf;base64,${base64Pdf}`,
       },
     },
   ];
