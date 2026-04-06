@@ -19,11 +19,11 @@ import {
 } from '../prompts/extract-params.js';
 import { findCategory } from '../data/material-categories.js';
 
-const EXTRACT_BATCH_SIZE = 30;
 
 /**
  * Извлекает структурированные параметры для всего списка позиций.
- * Обрабатывает позиции батчами по EXTRACT_BATCH_SIZE и объединяет результаты.
+ * Обрабатывает позиции батчами и объединяет результаты.
+ * Батчи запускаются параллельно с ограничением config.EXTRACT_CONCURRENCY.
  */
 export async function extractParameters(
   items: RawItemForExtraction[],
@@ -32,42 +32,61 @@ export async function extractParameters(
 ): Promise<ExtractedItem[]> {
   if (items.length === 0) return [];
 
+  const batchSize = config.EXTRACT_BATCH_SIZE;
   const batches: RawItemForExtraction[][] = [];
-  for (let i = 0; i < items.length; i += EXTRACT_BATCH_SIZE) {
-    batches.push(items.slice(i, i + EXTRACT_BATCH_SIZE));
+  for (let i = 0; i < items.length; i += batchSize) {
+    batches.push(items.slice(i, i + batchSize));
   }
 
   console.log(
-    `[extract] ${label}: ${items.length} позиций → ${batches.length} батч(ей) по ${EXTRACT_BATCH_SIZE}`
+    `[extract] ${label}: ${items.length} позиций → ${batches.length} батч(ей) по ${batchSize} (parallelism=${config.EXTRACT_CONCURRENCY})`
   );
+
+  const batchResults: ExtractedItem[][] = new Array(batches.length);
+  let nextBatch = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const idx = nextBatch++;
+      if (idx >= batches.length) return;
+      const batch = batches[idx]!;
+      const { systemPrompt, userMessage } = buildExtractParamsPrompt(batch);
+
+      console.log(`[extract] ${label}: батч ${idx + 1}/${batches.length} (${batch.length} позиций)`);
+
+      const llmResponse = await callOpenRouter({
+        model: config.OPENROUTER_MODEL_EXTRACT,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.1,
+        responseFormat: { type: 'json_object' },
+        signal,
+        timeoutMs: config.LLM_EXTRACT_TIMEOUT_MS,
+      });
+
+      const parsed = parseExtractResponse(llmResponse);
+      const out: ExtractedItem[] = [];
+      for (const it of parsed.items ?? []) {
+        const normalized = normalizeExtractedItem(it);
+        if (normalized) out.push(normalized);
+      }
+      batchResults[idx] = out;
+    }
+  }
+
+  const workerCount = Math.min(config.EXTRACT_CONCURRENCY, batches.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   const merged: ExtractedItem[] = [];
   const seenPositions = new Set<number>();
-
-  for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-    const batch = batches[batchIdx]!;
-    const { systemPrompt, userMessage } = buildExtractParamsPrompt(batch);
-
-    console.log(`[extract] ${label}: батч ${batchIdx + 1}/${batches.length} (${batch.length} позиций)`);
-
-    const llmResponse = await callOpenRouter({
-      model: config.OPENROUTER_MODEL_EXTRACT,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
-      ],
-      temperature: 0.1,
-      responseFormat: { type: 'json_object' },
-      signal,
-    });
-
-    const parsed = parseExtractResponse(llmResponse);
-
-    for (const it of parsed.items ?? []) {
-      const normalized = normalizeExtractedItem(it);
-      if (normalized && !seenPositions.has(normalized.position)) {
-        merged.push(normalized);
-        seenPositions.add(normalized.position);
+  for (const batchOut of batchResults) {
+    if (!batchOut) continue;
+    for (const it of batchOut) {
+      if (!seenPositions.has(it.position)) {
+        merged.push(it);
+        seenPositions.add(it.position);
       }
     }
   }

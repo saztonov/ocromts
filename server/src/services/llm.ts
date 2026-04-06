@@ -18,6 +18,7 @@ export interface CallOpenRouterParams {
   maxTokens?: number;
   responseFormat?: { type: 'json_object' };
   signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 interface OpenRouterChoice {
@@ -43,7 +44,8 @@ const LLM_CALL_TIMEOUT_MS = config.LLM_CALL_TIMEOUT_MS;
  * Retries up to MAX_RETRIES times on HTTP 429 with exponential backoff.
  */
 export async function callOpenRouter(params: CallOpenRouterParams): Promise<string> {
-  const { model, messages, temperature = 0.1, maxTokens, responseFormat, signal } = params;
+  const { model, messages, temperature = 0.1, maxTokens, responseFormat, signal, timeoutMs } = params;
+  const callTimeoutMs = timeoutMs ?? LLM_CALL_TIMEOUT_MS;
 
   const body: Record<string, unknown> = {
     model,
@@ -81,7 +83,7 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
 
     try {
       // Combine caller's abort signal with per-call timeout
-      const timeoutSignal = AbortSignal.timeout(LLM_CALL_TIMEOUT_MS);
+      const timeoutSignal = AbortSignal.timeout(callTimeoutMs);
       const fetchSignal = signal
         ? AbortSignal.any([signal, timeoutSignal])
         : timeoutSignal;
@@ -160,7 +162,7 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
         throw err;
       }
       if (err instanceof Error && err.name === 'TimeoutError') {
-        console.error(`[llm] ← Timeout after ${elapsed}s (limit: ${LLM_CALL_TIMEOUT_MS / 1000}s)`);
+        console.error(`[llm] ← Timeout after ${elapsed}s (limit: ${callTimeoutMs / 1000}s)`);
         lastError = err;
         if (attempt < 1) continue; // один повтор по таймауту, дальше — fail
         throw err;
