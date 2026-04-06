@@ -164,7 +164,7 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
       if (err instanceof Error && err.name === 'TimeoutError') {
         console.error(`[llm] ← Timeout after ${elapsed}s (limit: ${callTimeoutMs / 1000}s)`);
         lastError = err;
-        if (attempt < 1) continue; // один повтор по таймауту, дальше — fail
+        if (attempt < 2) continue; // до двух повторов по таймауту, дальше — fail
         throw err;
       }
       if (err instanceof Error && err.message.includes('429')) {

@@ -38,5 +38,5 @@ export const config: AppConfig = {
   LLM_EXTRACT_TIMEOUT_MS: Number(process.env.LLM_EXTRACT_TIMEOUT_MS ?? 180_000),
   PIPELINE_TIMEOUT_MS: Number(process.env.PIPELINE_TIMEOUT_MS ?? 30 * 60 * 1000),
   EXTRACT_BATCH_SIZE: Number(process.env.EXTRACT_BATCH_SIZE ?? 10),
-  EXTRACT_CONCURRENCY: Number(process.env.EXTRACT_CONCURRENCY ?? 3),
+  EXTRACT_CONCURRENCY: Number(process.env.EXTRACT_CONCURRENCY ?? 1),
 };
