@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import * as XLSX from 'xlsx';
 import { getDb } from '../db/connection.js';
 import { config } from '../config.js';
 import { startComparison, cancelComparison, runStageB, retryStageAItem, type ComparisonMethod } from '../services/comparison.js';
@@ -296,6 +297,182 @@ router.delete('/:id', (req: Request, res: Response): void => {
   }
 
   res.json({ success: true });
+});
+
+/**
+ * GET /api/comparisons/:id/export
+ * Выгрузка результатов сверки в Excel (две вкладки: Сводка и Результаты).
+ */
+router.get('/:id/export', (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const db = getDb();
+
+  const comparison = db.prepare('SELECT * FROM comparisons WHERE id = ?').get(id) as
+    | (ComparisonRow & { comparison_method?: string | null })
+    | undefined;
+  if (!comparison) {
+    res.status(404).json({ error: 'Comparison not found' });
+    return;
+  }
+  if (comparison.status !== 'done') {
+    res.status(409).json({ error: `Экспорт доступен только для завершённых сверок (текущий статус: ${comparison.status})` });
+    return;
+  }
+
+  const orderItems = db.prepare(
+    'SELECT * FROM order_items WHERE comparison_id = ? ORDER BY position'
+  ).all(id) as OrderItemRow[];
+  const invoiceItems = db.prepare(
+    'SELECT * FROM invoice_items WHERE comparison_id = ? ORDER BY position'
+  ).all(id) as InvoiceItemRow[];
+  const results = db.prepare(
+    'SELECT * FROM comparison_results WHERE comparison_id = ? ORDER BY id'
+  ).all(id) as ComparisonResultRow[];
+
+  const orderById = new Map(orderItems.map((i) => [i.id, i]));
+  const invoiceById = new Map(invoiceItems.map((i) => [i.id, i]));
+
+  const summary = comparison.summary_json ? JSON.parse(comparison.summary_json) as {
+    total_order?: number;
+    total_invoice?: number;
+    matched?: number;
+    unmatched_order?: number;
+    unmatched_invoice?: number;
+    critical_mismatches?: number;
+    warnings?: number;
+  } : {};
+
+  // ---- Sheet 1: Сводка ----
+  const summaryRows: (string | number)[][] = [
+    ['Сверка', comparison.name ?? ''],
+    ['ID', comparison.id],
+    ['Файл заказа', comparison.order_filename],
+    ['Файл счёта', comparison.invoice_filename],
+    ['Метод сравнения', comparison.comparison_method ?? ''],
+    ['Дата создания', comparison.created_at],
+    [],
+    ['Всего в заказе', summary.total_order ?? 0],
+    ['Всего в счёте', summary.total_invoice ?? 0],
+    ['Совпало', summary.matched ?? 0],
+    ['Частичные (warnings)', summary.warnings ?? 0],
+    ['Критические расхождения', summary.critical_mismatches ?? 0],
+    ['Нет в счёте', summary.unmatched_order ?? 0],
+    ['Лишние в счёте', summary.unmatched_invoice ?? 0],
+  ];
+  const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
+  wsSummary['!cols'] = [{ wch: 28 }, { wch: 60 }];
+
+  // ---- Sheet 2: Результаты ----
+  const statusLabel: Record<string, string> = {
+    matched: 'Совпало',
+    partial: 'Частично',
+    mismatch: 'Расхождение',
+    unmatched_order: 'Нет в счёте',
+    unmatched_invoice: 'Лишнее в счёте',
+  };
+  const qtyStatusLabel: Record<string, string> = {
+    exact: 'Точно',
+    within_tolerance: 'В допуске',
+    over: 'Больше',
+    under: 'Меньше',
+    incompatible_units: 'Несовместимые ед.',
+  };
+
+  interface DiscrepancyItem {
+    parameter?: string;
+    spec_value?: string | null;
+    invoice_value?: string | null;
+    severity?: string;
+    comment?: string;
+  }
+
+  const sorted = [...results].sort((a, b) => {
+    const oa = a.order_item_id ? orderById.get(a.order_item_id)?.position ?? Infinity : Infinity;
+    const ob = b.order_item_id ? orderById.get(b.order_item_id)?.position ?? Infinity : Infinity;
+    if (oa !== ob) return oa - ob;
+    const ia = a.invoice_item_id ? invoiceById.get(a.invoice_item_id)?.position ?? Infinity : Infinity;
+    const ib = b.invoice_item_id ? invoiceById.get(b.invoice_item_id)?.position ?? Infinity : Infinity;
+    return ia - ib;
+  });
+
+  const header = [
+    '#',
+    'Поз. заказа', 'Наименование (заказ)', 'Кол-во заказ', 'Ед. заказ',
+    'Поз. счёта', 'Наименование (счёт)', 'Кол-во счёт', 'Ед. счёт', 'Цена', 'Сумма',
+    'Статус', 'Кол-во статус', 'Δ %', 'Confidence %', 'Метод',
+    'Расхождения', 'Комментарий модели', 'Конвертация ед.',
+  ];
+  const dataRows: (string | number | null)[][] = sorted.map((r, idx) => {
+    const o = r.order_item_id ? orderById.get(r.order_item_id) : undefined;
+    const inv = r.invoice_item_id ? invoiceById.get(r.invoice_item_id) : undefined;
+
+    let discrepancies: DiscrepancyItem[] = [];
+    if (r.discrepancies_json) {
+      try {
+        const parsed = JSON.parse(r.discrepancies_json);
+        if (Array.isArray(parsed)) discrepancies = parsed as DiscrepancyItem[];
+      } catch {
+        // ignore malformed
+      }
+    }
+    const discrText = discrepancies
+      .map((d) => {
+        const sev = d.severity ? `[${d.severity}] ` : '';
+        const param = d.parameter ?? '';
+        const spec = d.spec_value ?? '—';
+        const invVal = d.invoice_value ?? '—';
+        const cmt = d.comment ? ` (${d.comment})` : '';
+        return `${sev}${param}: ${spec} → ${invVal}${cmt}`;
+      })
+      .join('\n');
+
+    return [
+      idx + 1,
+      o?.position ?? null, o?.raw_name ?? '', o?.quantity ?? null, o?.unit ?? '',
+      inv?.position ?? null, inv?.raw_name ?? '', inv?.quantity ?? null, inv?.unit ?? '',
+      inv?.unit_price ?? null, inv?.total_price ?? null,
+      statusLabel[r.match_status] ?? r.match_status,
+      r.quantity_status ? (qtyStatusLabel[r.quantity_status] ?? r.quantity_status) : '',
+      r.quantity_diff_pct ?? null,
+      r.match_confidence != null ? Math.round(r.match_confidence * 100) : null,
+      (r as ComparisonResultRow & { method?: string }).method ?? '',
+      discrText,
+      r.reasoning ?? '',
+      r.conversion_note ?? '',
+    ];
+  });
+
+  const wsResults = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
+  wsResults['!cols'] = [
+    { wch: 5 },
+    { wch: 8 }, { wch: 50 }, { wch: 11 }, { wch: 8 },
+    { wch: 8 }, { wch: 50 }, { wch: 11 }, { wch: 8 }, { wch: 11 }, { wch: 12 },
+    { wch: 16 }, { wch: 16 }, { wch: 8 }, { wch: 13 }, { wch: 8 },
+    { wch: 60 }, { wch: 60 }, { wch: 30 },
+  ];
+  // Включить перенос строк для текстовых колонок
+  const range = XLSX.utils.decode_range(wsResults['!ref'] ?? 'A1');
+  for (let R = 1; R <= range.e.r; R++) {
+    for (const C of [16, 17, 18]) {
+      const cell = wsResults[XLSX.utils.encode_cell({ r: R, c: C })];
+      if (cell) cell.s = { alignment: { wrapText: true, vertical: 'top' } };
+    }
+  }
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, wsSummary, 'Сводка');
+  XLSX.utils.book_append_sheet(wb, wsResults, 'Результаты');
+
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+
+  const baseName = (comparison.name ?? `comparison-${comparison.id}`).replace(/[\\/:*?"<>|]/g, '_');
+  const fallback = `comparison-${comparison.id}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(baseName + '.xlsx')}`
+  );
+  res.send(buf);
 });
 
 export default router;

@@ -179,7 +179,20 @@ export default function ComparisonPage() {
                   </span>
                 </div>
               </div>
-              <StatusBadge status={comparison.status} />
+              <div className="flex items-center gap-3">
+                {comparison.status === 'done' && (
+                  <a
+                    href={`/api/comparisons/${comparison.id}/export`}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4" aria-hidden="true">
+                      <path fillRule="evenodd" d="M10 3a.75.75 0 01.75.75v7.69l2.22-2.22a.75.75 0 111.06 1.06l-3.5 3.5a.75.75 0 01-1.06 0l-3.5-3.5a.75.75 0 111.06-1.06l2.22 2.22V3.75A.75.75 0 0110 3zM3.75 14a.75.75 0 01.75.75v1.5c0 .138.112.25.25.25h10.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 0115.25 18H4.75A1.75 1.75 0 013 16.25v-1.5a.75.75 0 01.75-.75z" clipRule="evenodd" />
+                    </svg>
+                    Скачать Excel
+                  </a>
+                )}
+                <StatusBadge status={comparison.status} />
+              </div>
             </div>
           </div>
 
