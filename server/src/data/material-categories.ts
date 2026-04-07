@@ -46,6 +46,16 @@ export interface MaterialCategory {
   shapeMatters: boolean;
   /** Параметры категории */
   keyParams: ParamSpec[];
+  /**
+   * Коды параметров, образующих неупорядоченную размерную группу.
+   * Например: для прямоугольного воздуховода `['B','H']` означает, что
+   * сечение 250×600 эквивалентно 600×250. Нормализатор отсортирует
+   * значения этих кодов по возрастанию и запишет их обратно в исходные ключи.
+   * Используется только если все коды в одной группе (`geometry`/...) и
+   * соответствующие значения числовые. Должно содержать параметры с одинаковой
+   * единицей измерения, иначе сортировка бессмысленна.
+   */
+  unorderedDims?: string[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,6 +102,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Воздуховод',
     synonyms: ['воздуховод', 'короб', 'duct'],
     shapeMatters: true,
+    unorderedDims: ['B', 'H'],
     keyParams: [
       { code: 'L',                 group: 'geometry', label: 'Длина',          unit: 'мм', severity: 'critical', tolerance: { type: 'abs', value: 50 } },
       { code: 'D',                 group: 'geometry', label: 'Диаметр',        unit: 'мм', severity: 'critical', tolerance: { type: 'exact' } },
@@ -109,6 +120,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Фитинг воздуховода',
     synonyms: ['отвод', 'тройник', 'переход', 'заслонка', 'клапан', 'фланец', 'муфта воздуховода'],
     shapeMatters: true,
+    unorderedDims: ['B', 'H'],
     keyParams: [
       { code: 'D',                 group: 'geometry', label: 'Диаметр',        unit: 'мм', severity: 'critical', tolerance: { type: 'exact' } },
       { code: 'B',                 group: 'geometry', label: 'Ширина сечения', unit: 'мм', severity: 'critical', tolerance: { type: 'abs', value: 1 } },
@@ -125,6 +137,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Труба стальная',
     synonyms: ['труба стальная', 'труба бесшовная', 'труба электросварная', 'труба ВГП', 'труба профильная', 'б/ш', 'э/с'],
     shapeMatters: false,
+    unorderedDims: ['B', 'H'],
     keyParams: [
       { code: 'D',                 group: 'geometry', label: 'Наружный диаметр', unit: 'мм', severity: 'critical', tolerance: { type: 'abs', value: 1 } },
       { code: 'wall_thickness_mm', group: 'geometry', label: 'Толщина стенки',   unit: 'мм', severity: 'critical', tolerance: { type: 'abs', value: 0.2 } },
@@ -159,6 +172,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Лист металлический',
     synonyms: ['лист', 'полоса', 'г/к лист', 'х/к лист', 'рифлёный лист', 'просечно-вытяжной'],
     shapeMatters: false,
+    unorderedDims: ['L', 'B'],
     keyParams: [
       { code: 'thickness_mm', group: 'geometry', label: 'Толщина', unit: 'мм', severity: 'critical', tolerance: { type: 'abs', value: 0.1 } },
       { code: 'B',            group: 'geometry', label: 'Ширина',  unit: 'мм', severity: 'warning',  tolerance: { type: 'abs', value: 5 } },
@@ -209,6 +223,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Профнастил',
     synonyms: ['профнастил', 'профлист', 'металлочерепица', 'С8', 'С21', 'НС35', 'Н60', 'Н75', 'Н114'],
     shapeMatters: false,
+    unorderedDims: ['L', 'B'],
     keyParams: [
       { code: 'profile_mark',  group: 'geometry', label: 'Марка профиля',                 severity: 'critical', tolerance: { type: 'exact' } },
       { code: 'thickness_mm',  group: 'geometry', label: 'Толщина металла', unit: 'мм',   severity: 'critical', tolerance: { type: 'abs', value: 0.05 } },
@@ -225,6 +240,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Бетон / ЖБИ',
     synonyms: ['бетон', 'ЖБИ', 'плита перекрытия', 'фбс', 'фундаментный блок'],
     shapeMatters: false,
+    unorderedDims: ['L', 'B', 'H'],
     keyParams: [
       { code: 'strength_class', group: 'material', label: 'Класс прочности (B)',           severity: 'critical', tolerance: { type: 'exact' } },
       { code: 'mark_legacy',    group: 'material', label: 'Марка (M)',                     severity: 'warning',  tolerance: { type: 'exact' } },
@@ -243,6 +259,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Кирпич / блок',
     synonyms: ['кирпич', 'блок', 'газобетон', 'пенобетон', 'газоблок'],
     shapeMatters: false,
+    unorderedDims: ['L', 'B', 'H'],
     keyParams: [
       { code: 'material_type',  group: 'material', label: 'Тип',                          severity: 'critical', tolerance: { type: 'exact' } },
       { code: 'mark_strength',  group: 'material', label: 'Марка прочности (M)',          severity: 'critical', tolerance: { type: 'exact' } },
@@ -261,6 +278,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Утеплитель',
     synonyms: ['утеплитель', 'минвата', 'пенополистирол', 'XPS', 'EPS', 'PIR', 'ППУ', 'пеноплекс', 'пеноплэкс', 'базальт'],
     shapeMatters: false,
+    unorderedDims: ['L', 'B'],
     keyParams: [
       { code: 'material_type',     group: 'material', label: 'Тип утеплителя',              severity: 'critical', tolerance: { type: 'exact' } },
       { code: 'density',           group: 'material', label: 'Плотность',     unit: 'кг/м³', severity: 'critical', tolerance: { type: 'exact' } },
@@ -296,6 +314,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Пиломатериал',
     synonyms: ['доска', 'брус', 'брусок', 'рейка', 'вагонка', 'фанера', 'OSB', 'ДСП', 'ОСБ'],
     shapeMatters: false,
+    unorderedDims: ['B', 'H'],
     keyParams: [
       { code: 'lumber_type', group: 'material', label: 'Тип',                              severity: 'critical', tolerance: { type: 'exact' } },
       { code: 'wood_species',group: 'material', label: 'Порода',                           severity: 'warning',  tolerance: { type: 'exact' } },
@@ -378,6 +397,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Стекло',
     synonyms: ['стекло', 'стеклопакет', 'триплекс', 'закалённое'],
     shapeMatters: false,
+    unorderedDims: ['B', 'H'],
     keyParams: [
       { code: 'glass_type',   group: 'material', label: 'Тип',                       severity: 'critical', tolerance: { type: 'exact' } },
       { code: 'thickness_mm', group: 'geometry', label: 'Толщина',     unit: 'мм',   severity: 'critical', tolerance: { type: 'exact' } },
@@ -411,6 +431,7 @@ export const MATERIAL_CATEGORIES: MaterialCategory[] = [
     label: 'Прочее',
     synonyms: [],
     shapeMatters: false,
+    unorderedDims: ['L', 'B', 'H'],
     keyParams: [
       { code: 'L', group: 'geometry', label: 'Длина',  unit: 'мм', severity: 'warning', tolerance: { type: 'abs', value: 5 } },
       { code: 'B', group: 'geometry', label: 'Ширина', unit: 'мм', severity: 'warning', tolerance: { type: 'abs', value: 5 } },

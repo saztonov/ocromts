@@ -406,13 +406,14 @@ function normalizeExtractedItem(raw: unknown, expectedPosition: number): Extract
   const position = typeof obj.position === 'number' ? obj.position : expectedPosition;
 
   const categoryRaw = typeof obj.category === 'string' ? obj.category : 'other';
-  const category = findCategory(categoryRaw).id;
+  const categoryDef = findCategory(categoryRaw);
+  const category = categoryDef.id;
 
   const shape = obj.shape;
   const normShape =
     shape === 'round' || shape === 'rectangular' || shape === 'square' ? shape : null;
 
-  return {
+  const item: ExtractedItem = {
     position,
     category,
     type: typeof obj.type === 'string' ? obj.type : null,
@@ -422,6 +423,51 @@ function normalizeExtractedItem(raw: unknown, expectedPosition: number): Extract
     standards: toRecord(obj.standards),
     extra: toRecord(obj.extra),
   };
+
+  // Канонизация неупорядоченных размерных групп категории.
+  // Например: для прямоугольного воздуховода {B,H} → отсортированы по возрастанию,
+  // чтобы 250×600 и 600×250 давали одинаковый снимок и не считались расхождением
+  // ни в parameter-comparator, ни в fingerprint Fuse.
+  // Для shapeMatters-категорий применяем только при rectangular (round/square не нуждаются).
+  if (categoryDef.unorderedDims && categoryDef.unorderedDims.length >= 2) {
+    if (!categoryDef.shapeMatters || normShape === 'rectangular') {
+      canonicalizeUnorderedDims(item, categoryDef.unorderedDims);
+    }
+  }
+
+  return item;
+}
+
+/**
+ * Сортирует значения параметров `codes` по возрастанию и записывает обратно
+ * по тем же ключам в исходном порядке. Применимо только если все коды лежат
+ * в одной группе ExtractedItem (geometry/material/standards/extra) и все
+ * значения числовые. В противном случае — no-op.
+ */
+function canonicalizeUnorderedDims(item: ExtractedItem, codes: string[]): void {
+  const groups: Array<Record<string, number | string | null>> = [
+    item.geometry,
+    item.material,
+    item.standards,
+    item.extra,
+  ];
+
+  // Найти группу, в которой лежат все коды и все значения — числа.
+  let target: Record<string, number | string | null> | null = null;
+  for (const g of groups) {
+    if (!g) continue;
+    const allNumeric = codes.every((c) => typeof g[c] === 'number');
+    if (allNumeric) {
+      target = g;
+      break;
+    }
+  }
+  if (!target) return;
+
+  const values = codes.map((c) => target![c] as number).sort((a, b) => a - b);
+  for (let i = 0; i < codes.length; i++) {
+    target[codes[i]!] = values[i]!;
+  }
 }
 
 function toRecord(value: unknown): Record<string, number | string | null> {
