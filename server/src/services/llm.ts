@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { dumpRequest, dumpResponse, dumpError, type DumpContext } from '../utils/llm-dump.js';
+import { dumpRequest, dumpResponse, dumpError, stripBase64ImagesExternal, type DumpContext, type DumpAggregator } from '../utils/llm-dump.js';
 
 /** A single message in the OpenRouter chat format. */
 export interface ChatMessage {
@@ -22,6 +22,10 @@ export interface CallOpenRouterParams {
   timeoutMs?: number;
   /** Если задан — все request/response/error будут сдамплены в debug/<comparisonId>/<stage>/<name>_*. */
   dumpContext?: DumpContext;
+  /** Если задан — request/response/error пишутся в агрегатор (один all.json на стадию). */
+  dumpAggregator?: DumpAggregator;
+  /** Позиция для агрегатора (обязательна вместе с dumpAggregator). */
+  dumpPosition?: number;
 }
 
 interface OpenRouterChoice {
@@ -47,7 +51,7 @@ const LLM_CALL_TIMEOUT_MS = config.LLM_CALL_TIMEOUT_MS;
  * Retries up to MAX_RETRIES times on HTTP 429 with exponential backoff.
  */
 export async function callOpenRouter(params: CallOpenRouterParams): Promise<string> {
-  const { model, messages, temperature = 0.1, maxTokens, responseFormat, signal, timeoutMs, dumpContext } = params;
+  const { model, messages, temperature = 0.1, maxTokens, responseFormat, signal, timeoutMs, dumpContext, dumpAggregator, dumpPosition } = params;
   const callTimeoutMs = timeoutMs ?? LLM_CALL_TIMEOUT_MS;
 
   // Дамп запроса (один раз на cовокупность попыток).
@@ -62,6 +66,16 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
       responseFormat,
       timeoutMs: callTimeoutMs,
       messages,
+    });
+  } else if (dumpAggregator && typeof dumpPosition === 'number') {
+    const cleanedMessages = stripBase64ImagesExternal(messages, dumpAggregator.baseDir, dumpAggregator.imagesSubdir);
+    dumpAggregator.record(dumpPosition, 'request', {
+      model,
+      temperature,
+      maxTokens,
+      responseFormat,
+      timeoutMs: callTimeoutMs,
+      messages: cleanedMessages,
     });
   }
 
@@ -181,6 +195,15 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
           usage: data.usage,
           validJson: jsonMode ? isValidJson(content) : undefined,
         });
+      } else if (dumpAggregator && typeof dumpPosition === 'number') {
+        dumpAggregator.record(dumpPosition, 'response', {
+          elapsedMs: Date.now() - startTime,
+          httpStatus: response.status,
+          content,
+          finishReason,
+          usage: data.usage,
+          validJson: jsonMode ? isValidJson(content) : undefined,
+        });
       }
 
       return content;
@@ -188,26 +211,40 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
       const elapsedMs = Date.now() - startTime;
       const elapsed = (elapsedMs / 1000).toFixed(1);
       // If the caller's signal was aborted, stop immediately (user cancel)
+      const recordErr = (willRetry: boolean) => {
+        if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry, elapsedMs });
+        else if (dumpAggregator && typeof dumpPosition === 'number') {
+          const e = err instanceof Error ? err : new Error(String(err));
+          dumpAggregator.record(dumpPosition, 'error', {
+            timestamp: new Date().toISOString(),
+            errorName: e.name,
+            errorMessage: e.message,
+            attempt: attempt + 1,
+            willRetry,
+            elapsedMs,
+          });
+        }
+      };
       if (signal?.aborted) {
         console.error(`[llm] ← Aborted by caller signal (${elapsed}s)`);
-        if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry: false, elapsedMs });
+        recordErr(false);
         throw err;
       }
       if (err instanceof Error && err.name === 'TimeoutError') {
         console.error(`[llm] ← Timeout after ${elapsed}s (limit: ${callTimeoutMs / 1000}s)`);
         lastError = err;
         const willRetry = attempt < 2;
-        if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry, elapsedMs });
+        recordErr(willRetry);
         if (willRetry) continue;
         throw err;
       }
       if (err instanceof Error && err.message.includes('429')) {
         lastError = err;
-        if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry: true, elapsedMs });
+        recordErr(true);
         continue;
       }
       console.error(`[llm] ← Error (${elapsed}s): ${err instanceof Error ? err.message : String(err)}`);
-      if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry: false, elapsedMs });
+      recordErr(false);
       throw err;
     }
   }

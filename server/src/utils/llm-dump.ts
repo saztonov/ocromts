@@ -120,6 +120,75 @@ export function dumpJson(comparisonId: string, relativePath: string, data: unkno
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Dump aggregator — собирает request/response/parsed/error по многим позициям
+// и сбрасывает одним all.json. Нужен чтобы Stage A (и другие построчные стадии)
+// не плодили сотни мелких файлов.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface AggregatorEntry {
+  position: number;
+  request?: unknown;
+  response?: unknown;
+  parsed?: unknown;
+  errors?: unknown[];
+}
+
+export interface DumpAggregator {
+  readonly comparisonId: string;
+  readonly stage: string;
+  /** Базовая директория, куда можно сохранять картинки/файлы, вынесенные из request. */
+  readonly baseDir: string;
+  /** Имя подпапки для картинок (общая на весь агрегатор). */
+  readonly imagesSubdir: string;
+  record(position: number, kind: 'request' | 'response' | 'parsed' | 'error', data: unknown): void;
+  flush(): void;
+}
+
+export function createDumpAggregator(comparisonId: string, stage: string): DumpAggregator {
+  const entries = new Map<number, AggregatorEntry>();
+  const baseDir = path.join(config.DEBUG_DUMP_DIR, comparisonId, stage);
+  const imagesSubdir = 'all_request_images';
+
+  function get(position: number): AggregatorEntry {
+    let e = entries.get(position);
+    if (!e) {
+      e = { position };
+      entries.set(position, e);
+    }
+    return e;
+  }
+
+  return {
+    comparisonId,
+    stage,
+    baseDir,
+    imagesSubdir,
+    record(position, kind, data) {
+      if (!isEnabled()) return;
+      const e = get(position);
+      if (kind === 'request') e.request = data;
+      else if (kind === 'response') e.response = data;
+      else if (kind === 'parsed') e.parsed = data;
+      else {
+        if (!e.errors) e.errors = [];
+        e.errors.push(data);
+      }
+    },
+    flush() {
+      if (!isEnabled()) return;
+      const items = Array.from(entries.values()).sort((a, b) => a.position - b.position);
+      const file = path.join(baseDir, 'all.json');
+      safeWrite(file, JSON.stringify({ timestamp: new Date().toISOString(), items }, null, 2));
+    },
+  };
+}
+
+/** Экспортируется для использования из llm.ts при записи через агрегатор. */
+export function stripBase64ImagesExternal(payload: unknown, baseDir: string, imagesSubdir: string): unknown {
+  return stripBase64Images(payload, baseDir, imagesSubdir);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Глубоко обходит payload, ищет message_part вида { type: 'image_url', image_url: { url: 'data:image/...;base64,...' } }

@@ -17,7 +17,7 @@ import {
   type RawItemForExtraction,
 } from '../prompts/extract-params.js';
 import { findCategory } from '../data/material-categories.js';
-import { dumpParsed, type DumpContext } from '../utils/llm-dump.js';
+import { dumpParsed, createDumpAggregator, type DumpContext, type DumpAggregator } from '../utils/llm-dump.js';
 
 export type ExtractSide = 'order' | 'invoice';
 
@@ -39,15 +39,18 @@ export interface ExtractParamsOptions {
  */
 export async function extractSingleParameter(
   item: RawItemForExtraction,
-  opts: { comparisonId: string; side: ExtractSide; signal?: AbortSignal; dumpName?: string }
+  opts: { comparisonId: string; side: ExtractSide; signal?: AbortSignal; dumpName?: string; dumpAggregator?: DumpAggregator }
 ): Promise<{ item: ExtractedItem; ok: boolean; error?: Error }> {
   const { systemPrompt, userMessage } = buildExtractParamsPromptSingle(item);
   const dumpName = opts.dumpName ?? `${String(item.position).padStart(3, '0')}_${item.position}`;
-  const dumpCtx: DumpContext = {
-    comparisonId: opts.comparisonId,
-    stage: `stage_a/${opts.side}`,
-    name: dumpName,
-  };
+  const useAggregator = !!opts.dumpAggregator;
+  const dumpCtx: DumpContext | undefined = useAggregator
+    ? undefined
+    : {
+        comparisonId: opts.comparisonId,
+        stage: `stage_a/${opts.side}`,
+        name: dumpName,
+      };
 
   const startMs = Date.now();
   try {
@@ -62,6 +65,8 @@ export async function extractSingleParameter(
       signal: opts.signal,
       timeoutMs: config.LLM_EXTRACT_TIMEOUT_MS,
       dumpContext: dumpCtx,
+      dumpAggregator: opts.dumpAggregator,
+      dumpPosition: useAggregator ? item.position : undefined,
     });
 
     const parsed = parseSingleResponse(llmResponse, item.position);
@@ -69,7 +74,8 @@ export async function extractSingleParameter(
     if (!normalized) {
       throw new Error('Не удалось нормализовать ответ LLM');
     }
-    dumpParsed(dumpCtx, normalized);
+    if (opts.dumpAggregator) opts.dumpAggregator.record(item.position, 'parsed', normalized);
+    else if (dumpCtx) dumpParsed(dumpCtx, normalized);
     const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
     console.log(
       `[stage-a] ${opts.comparisonId} ${opts.side} ${item.position}: "${truncate(item.rawName, 60)}" → ${normalized.category}/${normalized.shape ?? '-'} (${elapsed}s)`
@@ -82,7 +88,8 @@ export async function extractSingleParameter(
       `[stage-a] ${opts.comparisonId} ${opts.side} ${item.position}: ✗ ${error.message} (${elapsed}s) — fallback на 'other'`
     );
     const fallback = makeFallback(item.position);
-    dumpParsed(dumpCtx, { ...fallback, _error: error.message });
+    if (opts.dumpAggregator) opts.dumpAggregator.record(item.position, 'parsed', { ...fallback, _error: error.message });
+    else if (dumpCtx) dumpParsed(dumpCtx, { ...fallback, _error: error.message });
     return { item: fallback, ok: false, error };
   }
 }
@@ -103,27 +110,33 @@ export async function extractParameters(
 
   const results: ExtractedItem[] = [];
   const startedAt = Date.now();
+  const aggregator = createDumpAggregator(opts.comparisonId, `stage_a/${opts.side}`);
 
-  for (let i = 0; i < items.length; i++) {
-    if (opts.signal?.aborted) {
-      throw new Error('Extraction aborted');
+  try {
+    for (let i = 0; i < items.length; i++) {
+      if (opts.signal?.aborted) {
+        throw new Error('Extraction aborted');
+      }
+      const it = items[i]!;
+      console.log(`[stage-a] ${opts.comparisonId} ${opts.side} ${i + 1}/${items.length}: → ${truncate(it.rawName, 80)}`);
+
+      const { item: extracted, ok, error } = await extractSingleParameter(it, {
+        comparisonId: opts.comparisonId,
+        side: opts.side,
+        signal: opts.signal,
+        dumpName: String(it.position).padStart(3, '0'),
+        dumpAggregator: aggregator,
+      });
+
+      results.push(extracted);
+      if (ok) {
+        if (opts.onItemDone) await opts.onItemDone(extracted);
+      } else {
+        if (opts.onItemFailed) await opts.onItemFailed(extracted, error!);
+      }
     }
-    const it = items[i]!;
-    console.log(`[stage-a] ${opts.comparisonId} ${opts.side} ${i + 1}/${items.length}: → ${truncate(it.rawName, 80)}`);
-
-    const { item: extracted, ok, error } = await extractSingleParameter(it, {
-      comparisonId: opts.comparisonId,
-      side: opts.side,
-      signal: opts.signal,
-      dumpName: String(it.position).padStart(3, '0'),
-    });
-
-    results.push(extracted);
-    if (ok) {
-      if (opts.onItemDone) await opts.onItemDone(extracted);
-    } else {
-      if (opts.onItemFailed) await opts.onItemFailed(extracted, error!);
-    }
+  } finally {
+    aggregator.flush();
   }
 
   const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
