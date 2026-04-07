@@ -19,8 +19,8 @@ export interface AppConfig {
   LLM_CALL_TIMEOUT_MS: number;
   LLM_EXTRACT_TIMEOUT_MS: number;
   PIPELINE_TIMEOUT_MS: number;
-  EXTRACT_BATCH_SIZE: number;
-  EXTRACT_CONCURRENCY: number;
+  DEBUG_DUMP_DIR: string;
+  DEBUG_DUMP_ENABLED: boolean;
 }
 
 export const config: AppConfig = {
@@ -37,6 +37,6 @@ export const config: AppConfig = {
   LLM_CALL_TIMEOUT_MS: Number(process.env.LLM_CALL_TIMEOUT_MS ?? 600_000),
   LLM_EXTRACT_TIMEOUT_MS: Number(process.env.LLM_EXTRACT_TIMEOUT_MS ?? 180_000),
   PIPELINE_TIMEOUT_MS: Number(process.env.PIPELINE_TIMEOUT_MS ?? 30 * 60 * 1000),
-  EXTRACT_BATCH_SIZE: Number(process.env.EXTRACT_BATCH_SIZE ?? 10),
-  EXTRACT_CONCURRENCY: Number(process.env.EXTRACT_CONCURRENCY ?? 1),
+  DEBUG_DUMP_DIR: path.resolve(__dirname, '../../', process.env.DEBUG_DUMP_DIR ?? 'debug'),
+  DEBUG_DUMP_ENABLED: (process.env.DEBUG_DUMP ?? '1') !== '0',
 };

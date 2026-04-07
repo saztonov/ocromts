@@ -44,6 +44,14 @@ const config: Record<Status, { label: string; classes: string }> = {
     label: 'Сравнение...',
     classes: 'bg-amber-50 text-amber-700 border border-amber-200',
   },
+  extracting: {
+    label: 'Извлечение...',
+    classes: 'bg-amber-50 text-amber-700 border border-amber-200',
+  },
+  awaiting_method: {
+    label: 'Выбор метода',
+    classes: 'bg-sky-50 text-sky-700 border border-sky-200',
+  },
   error: {
     label: 'Ошибка',
     classes: 'bg-red-50 text-red-700 border border-red-200',

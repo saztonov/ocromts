@@ -1,4 +1,4 @@
-import type { Comparison, ComparisonDetail } from '../types';
+import type { Comparison, ComparisonDetail, ComparisonMethod } from '../types';
 
 const BASE = '/api';
 
@@ -64,4 +64,20 @@ export async function cancelComparison(id: string): Promise<void> {
 
 export async function deleteComparison(id: string): Promise<void> {
   await request<{ success: boolean }>(`/comparisons/${id}`, { method: 'DELETE' });
+}
+
+export async function startCompareWithMethod(id: string, method: ComparisonMethod): Promise<void> {
+  await request<{ id: string; status: string }>(`/comparisons/${id}/compare`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method }),
+  });
+}
+
+export async function retryStageAItem(id: string, side: 'order' | 'invoice', position: number): Promise<void> {
+  await request<{ success: boolean }>(`/comparisons/${id}/retry-item`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ side, position }),
+  });
 }

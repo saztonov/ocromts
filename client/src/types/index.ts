@@ -7,7 +7,17 @@ export type MatchStatus =
   // Legacy aliases (kept for backwards compatibility with old DB rows / filters)
   | 'order_only'
   | 'invoice_only';
-export type ComparisonStatus = 'pending' | 'parsing' | 'comparing' | 'done' | 'error' | 'cancelled';
+export type ComparisonStatus =
+  | 'pending'
+  | 'parsing'
+  | 'extracting'
+  | 'awaiting_method'
+  | 'comparing'
+  | 'done'
+  | 'error'
+  | 'cancelled';
+
+export type ComparisonMethod = 'fuzzy' | 'llm' | 'both';
 export type QuantityStatus = 'exact' | 'within_tolerance' | 'over' | 'under' | 'incompatible_units';
 
 /** Структурированные параметры одной позиции (Stage A: parameter-extractor). */
@@ -34,6 +44,13 @@ export interface Comparison {
   cancelled_at: string | null;
   created_at: string;
   summary_json: string | null;
+  comparison_method: ComparisonMethod | null;
+  stage_a_total: number;
+  stage_a_done: number;
+  stage_a_failed_position: number | null;
+  stage_a_failed_side: 'order' | 'invoice' | null;
+  stage_a_error: string | null;
+  stage_a_completed_at: string | null;
 }
 
 export interface ComparisonSummary {
@@ -83,6 +100,7 @@ export interface ComparisonResult {
   conversion_note: string | null;
   discrepancies_json: string | null;
   reasoning: string | null;
+  method: string;
 }
 
 export interface ComparisonDetail {

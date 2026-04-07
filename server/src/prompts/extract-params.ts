@@ -129,18 +129,34 @@ ${buildCategoryCatalog()}
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Строит system+user сообщения для извлечения параметров одного батча позиций.
+ * Строит system+user сообщения для извлечения параметров ОДНОЙ позиции.
+ *
+ * Stage A идёт построчно: один LLM-вызов = одна позиция = один объект ExtractedItem
+ * без обёртки `items[]`. Это даёт полную предсказуемость пайплайна и возможность
+ * сохранять промежуточные результаты в БД после каждой строки.
  */
-export function buildExtractParamsPrompt(items: RawItemForExtraction[]): ExtractPromptResult {
-  const itemsList = items
-    .map((it) => `${it.position}. ${it.rawName} — ${it.quantity} ${it.unit}`)
-    .join('\n');
+export function buildExtractParamsPromptSingle(item: RawItemForExtraction): ExtractPromptResult {
+  const userMessage = `## Позиция для извлечения параметров
 
-  const userMessage = `## Позиции для извлечения параметров (${items.length})
+Позиция: ${item.position}
+Наименование: ${item.rawName}
+Количество: ${item.quantity}
+Единица: ${item.unit}
 
-${itemsList}
+Извлеки структурированные параметры согласно справочнику. Верни ОДИН JSON-объект (без обёртки items[]) в формате:
 
-Извлеки структурированные параметры для каждой позиции согласно справочнику. Ответь строго в JSON-формате.`;
+{
+  "position": ${item.position},
+  "category": "...",
+  "type": "...",
+  "shape": null,
+  "geometry": {},
+  "material": {},
+  "standards": {},
+  "extra": {}
+}
+
+Все 4 группы (geometry/material/standards/extra) обязательны, могут быть пустыми объектами.`;
 
   return {
     systemPrompt: SYSTEM_PROMPT,

@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { dumpRequest, dumpResponse, dumpError, type DumpContext } from '../utils/llm-dump.js';
 
 /** A single message in the OpenRouter chat format. */
 export interface ChatMessage {
@@ -19,6 +20,8 @@ export interface CallOpenRouterParams {
   responseFormat?: { type: 'json_object' };
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Если задан — все request/response/error будут сдамплены в debug/<comparisonId>/<stage>/<name>_*. */
+  dumpContext?: DumpContext;
 }
 
 interface OpenRouterChoice {
@@ -44,8 +47,23 @@ const LLM_CALL_TIMEOUT_MS = config.LLM_CALL_TIMEOUT_MS;
  * Retries up to MAX_RETRIES times on HTTP 429 with exponential backoff.
  */
 export async function callOpenRouter(params: CallOpenRouterParams): Promise<string> {
-  const { model, messages, temperature = 0.1, maxTokens, responseFormat, signal, timeoutMs } = params;
+  const { model, messages, temperature = 0.1, maxTokens, responseFormat, signal, timeoutMs, dumpContext } = params;
   const callTimeoutMs = timeoutMs ?? LLM_CALL_TIMEOUT_MS;
+
+  // Дамп запроса (один раз на cовокупность попыток).
+  if (dumpContext) {
+    dumpRequest(dumpContext, {
+      comparisonId: dumpContext.comparisonId,
+      stage: dumpContext.stage,
+      name: dumpContext.name,
+      model,
+      temperature,
+      maxTokens,
+      responseFormat,
+      timeoutMs: callTimeoutMs,
+      messages,
+    });
+  }
 
   const body: Record<string, unknown> = {
     model,
@@ -153,25 +171,43 @@ export async function callOpenRouter(params: CallOpenRouterParams): Promise<stri
       // --- Log: preview response ---
       console.log(`[llm] Response preview: ${content.slice(0, 200)}${contentLen > 200 ? '...' : ''}`);
 
+      if (dumpContext) {
+        dumpResponse(dumpContext, {
+          elapsedMs: Date.now() - startTime,
+          httpStatus: response.status,
+          raw: data,
+          content,
+          finishReason,
+          usage: data.usage,
+          validJson: jsonMode ? isValidJson(content) : undefined,
+        });
+      }
+
       return content;
     } catch (err) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      const elapsedMs = Date.now() - startTime;
+      const elapsed = (elapsedMs / 1000).toFixed(1);
       // If the caller's signal was aborted, stop immediately (user cancel)
       if (signal?.aborted) {
         console.error(`[llm] ← Aborted by caller signal (${elapsed}s)`);
+        if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry: false, elapsedMs });
         throw err;
       }
       if (err instanceof Error && err.name === 'TimeoutError') {
         console.error(`[llm] ← Timeout after ${elapsed}s (limit: ${callTimeoutMs / 1000}s)`);
         lastError = err;
-        if (attempt < 2) continue; // до двух повторов по таймауту, дальше — fail
+        const willRetry = attempt < 2;
+        if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry, elapsedMs });
+        if (willRetry) continue;
         throw err;
       }
       if (err instanceof Error && err.message.includes('429')) {
         lastError = err;
+        if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry: true, elapsedMs });
         continue;
       }
       console.error(`[llm] ← Error (${elapsed}s): ${err instanceof Error ? err.message : String(err)}`);
+      if (dumpContext) dumpError(dumpContext, err, { attempt: attempt + 1, willRetry: false, elapsedMs });
       throw err;
     }
   }

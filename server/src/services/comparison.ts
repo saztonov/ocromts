@@ -1,75 +1,28 @@
+/**
+ * Оркестрация пайплайна сравнения.
+ *
+ * Stage A (extracting) — построчная классификация позиций через LLM, запись в БД
+ *   после каждой строки. По завершении статус → 'awaiting_method'.
+ *
+ * Затем пользователь выбирает метод сравнения через POST /api/comparisons/:id/compare.
+ * После этого запускается runStageB (comparing) с одним из методов:
+ *   - 'fuzzy' — Fuse.js + детерминированный валидатор
+ *   - 'llm'   — один LLM-вызов на оба документа целиком
+ *   - 'both'  — оба метода независимо, два набора результатов с разным `method`
+ */
+
 import path from 'node:path';
 import { getDb } from '../db/connection.js';
 import { config } from '../config.js';
 import { parseExcel } from './excel-parser.js';
 import { parsePdf } from './pdf-parser.js';
-import { callOpenRouter } from './llm.js';
-import { buildComparePrompt, type CompareItemInput } from '../prompts/compare.js';
-import { extractParameters } from './parameter-extractor.js';
-import type { ExtractedItem } from '../prompts/extract-params.js';
-import { compareItems, type CompareDecision } from './parameter-comparator.js';
+import { extractParameters, extractSingleParameter } from './parameter-extractor.js';
+import type { ExtractedItem, RawItemForExtraction } from '../prompts/extract-params.js';
+import { matchFuzzy } from './fuzzy-matcher.js';
+import { matchLlm, type MatchPair } from './llm-document-comparator.js';
+import { dumpJson } from '../utils/llm-dump.js';
 
-// ---- Types for the LLM comparison response ---- //
-
-interface ParameterMismatch {
-  parameter: string;
-  order_value: string;
-  invoice_value: string;
-  severity: 'critical' | 'warning' | 'info';
-}
-
-interface QuantityComparison {
-  order_qty: number;
-  order_unit: string;
-  invoice_qty: number;
-  invoice_unit: string;
-  converted_invoice_qty?: number;
-  converted_unit?: string;
-  difference_pct: number;
-  status: 'exact' | 'within_tolerance' | 'over' | 'under' | 'incompatible_units';
-  conversion_note?: string;
-}
-
-interface MatchedItem {
-  order_row: number;
-  invoice_row: number;
-  order_name: string;
-  invoice_name: string;
-  normalized_name?: string;
-  match_confidence: number;
-  match_reasoning: string;
-  parameter_mismatches: ParameterMismatch[];
-  quantity_comparison: QuantityComparison;
-}
-
-interface UnmatchedOrderItem {
-  order_row: number;
-  order_name: string;
-  reason: string;
-}
-
-interface UnmatchedInvoiceItem {
-  invoice_row: number;
-  invoice_name: string;
-  reason: string;
-}
-
-interface ComparisonSummary {
-  total_order: number;
-  total_invoice: number;
-  matched: number;
-  unmatched_order: number;
-  unmatched_invoice: number;
-  critical_mismatches: number;
-  warnings: number;
-}
-
-interface ComparisonLLMResult {
-  matched_items: MatchedItem[];
-  unmatched_order: UnmatchedOrderItem[];
-  unmatched_invoice: UnmatchedInvoiceItem[];
-  summary: ComparisonSummary;
-}
+export type ComparisonMethod = 'fuzzy' | 'llm' | 'both';
 
 // ---- DB row types ---- //
 
@@ -85,19 +38,18 @@ interface ComparisonRow {
   cancelled_at: string | null;
   created_at: string;
   summary_json: string | null;
+  comparison_method: string | null;
+  stage_a_total: number;
+  stage_a_done: number;
+  stage_a_failed_position: number | null;
+  stage_a_failed_side: string | null;
+  stage_a_error: string | null;
+  stage_a_completed_at: string | null;
 }
 
-interface InsertedItemRow {
-  id: number;
-  position: number;
-}
+// ---- Cancellation infrastructure ---- //
 
-// ---- Cancellation & progress infrastructure ---- //
-
-/** In-memory map of active comparison AbortControllers */
 const activeControllers = new Map<string, AbortController>();
-
-/** Maximum time for the entire comparison pipeline (from config) */
 const PIPELINE_TIMEOUT_MS = config.PIPELINE_TIMEOUT_MS;
 
 class CancellationError extends Error {
@@ -107,13 +59,11 @@ class CancellationError extends Error {
   }
 }
 
-/** Update both status and progress in one DB call */
 function updateProgress(comparisonId: string, status: string, progress: number): void {
   getDb().prepare('UPDATE comparisons SET status = ?, progress = ? WHERE id = ?')
     .run(status, progress, comparisonId);
 }
 
-/** Check if comparison was cancelled; throw CancellationError if so */
 function checkCancelled(comparisonId: string): void {
   const row = getDb().prepare('SELECT cancelled_at FROM comparisons WHERE id = ?')
     .get(comparisonId) as { cancelled_at: string | null } | undefined;
@@ -122,10 +72,6 @@ function checkCancelled(comparisonId: string): void {
   }
 }
 
-/**
- * Cancel a running comparison. Sets DB flag and aborts in-flight requests.
- * Returns true if the comparison was successfully cancelled.
- */
 export function cancelComparison(comparisonId: string): boolean {
   const result = getDb().prepare(
     "UPDATE comparisons SET cancelled_at = datetime('now'), status = 'cancelled', progress = 0, error_message = 'Отменено пользователем' WHERE id = ? AND status NOT IN ('done', 'error', 'cancelled')"
@@ -139,513 +85,372 @@ export function cancelComparison(comparisonId: string): boolean {
   return result.changes > 0;
 }
 
-// ---- Main orchestration ---- //
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGE A — построчное извлечение параметров
 
 /**
- * Runs the full comparison pipeline for a given comparison ID.
- * This function is called asynchronously after the upload endpoint returns.
+ * Парсит файлы, сохраняет сырые позиции в order_items/invoice_items,
+ * затем построчно прогоняет каждую позицию через LLM (Stage A).
+ * После каждой позиции обновляется params_json в соответствующей строке БД
+ * и инкрементируется counters.stage_a_done.
  *
- * Flow:
- * 1. Parse order file (Excel)
- * 2. Parse invoice file (PDF or Excel)
- * 3. Save parsed items to DB
- * 4. Send both item lists to LLM for normalization + comparison
- * 5. Save comparison results to DB
- *
- * Supports: progress tracking (0-100%), cancellation, and pipeline timeout.
+ * По завершении статус → 'awaiting_method'. Пользователь должен явно выбрать
+ * метод сравнения через POST /api/comparisons/:id/compare.
  */
-export async function startComparison(comparisonId: string): Promise<void> {
+export async function runStageA(comparisonId: string): Promise<void> {
   const db = getDb();
   const controller = new AbortController();
   activeControllers.set(comparisonId, controller);
 
-  // Pipeline timeout — abort if total time exceeds limit
-  const timeoutHandle = setTimeout(() => {
-    controller.abort();
-  }, PIPELINE_TIMEOUT_MS);
+  const timeoutHandle = setTimeout(() => controller.abort(), PIPELINE_TIMEOUT_MS);
 
   try {
-    // ---------- Step 1: Update status ----------
     updateProgress(comparisonId, 'parsing', 5);
 
     const comparison = db.prepare('SELECT * FROM comparisons WHERE id = ?').get(comparisonId) as ComparisonRow | undefined;
-    if (!comparison) {
-      throw new Error(`Comparison ${comparisonId} not found`);
-    }
+    if (!comparison) throw new Error(`Comparison ${comparisonId} not found`);
+
+    dumpJson(comparisonId, '00_meta.json', {
+      comparisonId,
+      name: comparison.name,
+      order_filename: comparison.order_filename,
+      invoice_filename: comparison.invoice_filename,
+      invoice_file_type: comparison.invoice_file_type,
+      created_at: comparison.created_at,
+      stage_a_started_at: new Date().toISOString(),
+    });
 
     const uploadsDir = path.join(config.UPLOADS_DIR, comparisonId);
     const orderFilePath = path.join(uploadsDir, comparison.order_filename);
     const invoiceFilePath = path.join(uploadsDir, comparison.invoice_filename);
 
-    // ---------- Step 2: Parse order (always Excel) ----------
+    // ---------- Парсинг файлов ----------
     checkCancelled(comparisonId);
-    console.log(`[comparison] Parsing order file: ${comparison.order_filename}`);
+    console.log(`[comparison] ${comparisonId} parsing order: ${comparison.order_filename}`);
     const orderItems = parseExcel(orderFilePath);
-    console.log(`[comparison] Parsed ${orderItems.length} order items`);
-
-    if (orderItems.length === 0) {
-      throw new Error('No items found in order file. Check the Excel format.');
-    }
+    console.log(`[comparison] ${comparisonId} parsed ${orderItems.length} order items`);
+    if (orderItems.length === 0) throw new Error('No items found in order file. Check the Excel format.');
 
     updateProgress(comparisonId, 'parsing', 15);
 
-    // ---------- Step 3: Parse invoice ----------
     checkCancelled(comparisonId);
-    console.log(`[comparison] Parsing invoice file: ${comparison.invoice_filename} (${comparison.invoice_file_type})`);
-    let invoiceItems;
-    if (comparison.invoice_file_type === 'pdf') {
-      invoiceItems = await parsePdf(invoiceFilePath, controller.signal);
-    } else {
-      invoiceItems = parseExcel(invoiceFilePath);
-    }
-    console.log(`[comparison] Parsed ${invoiceItems.length} invoice items`);
+    console.log(`[comparison] ${comparisonId} parsing invoice: ${comparison.invoice_filename} (${comparison.invoice_file_type})`);
+    const invoiceItems = comparison.invoice_file_type === 'pdf'
+      ? await parsePdf(invoiceFilePath, controller.signal, comparisonId)
+      : parseExcel(invoiceFilePath);
+    console.log(`[comparison] ${comparisonId} parsed ${invoiceItems.length} invoice items`);
+    if (invoiceItems.length === 0) throw new Error('No items found in invoice file. Check the file format.');
 
-    if (invoiceItems.length === 0) {
-      throw new Error('No items found in invoice file. Check the file format.');
-    }
+    updateProgress(comparisonId, 'parsing', 25);
 
-    updateProgress(comparisonId, 'parsing', 35);
-
-    // ---------- Step 4: Save parsed items to DB ----------
+    // ---------- Запись сырых позиций в БД ----------
     checkCancelled(comparisonId);
 
     const insertOrderItem = db.prepare(`
       INSERT INTO order_items (comparison_id, position, raw_name, quantity, unit)
       VALUES (?, ?, ?, ?, ?)
     `);
-
     const insertInvoiceItem = db.prepare(`
       INSERT INTO invoice_items (comparison_id, position, raw_name, quantity, unit, unit_price, total_price)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
 
-    // Map position -> inserted row ID for later linking
     const orderPositionToId = new Map<number, number>();
     const invoicePositionToId = new Map<number, number>();
 
-    const insertOrderItems = db.transaction(() => {
-      for (const item of orderItems) {
-        const result = insertOrderItem.run(
-          comparisonId,
-          item.position,
-          item.rawName,
-          item.quantity,
-          item.unit
-        );
-        orderPositionToId.set(item.position, Number(result.lastInsertRowid));
+    db.transaction(() => {
+      for (const it of orderItems) {
+        const r = insertOrderItem.run(comparisonId, it.position, it.rawName, it.quantity, it.unit);
+        orderPositionToId.set(it.position, Number(r.lastInsertRowid));
       }
-    });
-    insertOrderItems();
-
-    const insertInvoiceItems = db.transaction(() => {
-      for (const item of invoiceItems) {
-        const result = insertInvoiceItem.run(
-          comparisonId,
-          item.position,
-          item.rawName,
-          item.quantity,
-          item.unit,
-          item.unitPrice ?? null,
-          item.totalPrice ?? null
+      for (const it of invoiceItems) {
+        const r = insertInvoiceItem.run(
+          comparisonId, it.position, it.rawName, it.quantity, it.unit,
+          it.unitPrice ?? null, it.totalPrice ?? null
         );
-        invoicePositionToId.set(item.position, Number(result.lastInsertRowid));
+        invoicePositionToId.set(it.position, Number(r.lastInsertRowid));
       }
-    });
-    insertInvoiceItems();
+      // Инициализируем счётчики Stage A
+      db.prepare('UPDATE comparisons SET stage_a_total = ?, stage_a_done = 0 WHERE id = ?')
+        .run(orderItems.length + invoiceItems.length, comparisonId);
+    })();
 
-    updateProgress(comparisonId, 'comparing', 38);
-
-    // ---------- Step 4.5: Stage A — Extract structured parameters ----------
+    // ---------- Stage A: построчное извлечение ----------
     checkCancelled(comparisonId);
-    console.log(`[comparison] Stage A: extracting structured parameters...`);
+    updateProgress(comparisonId, 'extracting', 30);
 
-    const orderExtracted = await extractParameters(
-      orderItems.map((it) => ({
-        position: it.position,
-        rawName: it.rawName,
-        unit: it.unit,
-        quantity: it.quantity,
-      })),
-      controller.signal,
-      'order'
-    );
-
-    updateProgress(comparisonId, 'comparing', 42);
-
-    const invoiceExtracted = await extractParameters(
-      invoiceItems.map((it) => ({
-        position: it.position,
-        rawName: it.rawName,
-        unit: it.unit,
-        quantity: it.quantity,
-      })),
-      controller.signal,
-      'invoice'
-    );
-
-    // Persist extracted params (material_type, gost, params_json) into DB.
-    persistExtractedParams(db, 'order_items', orderPositionToId, orderExtracted);
-    persistExtractedParams(db, 'invoice_items', invoicePositionToId, invoiceExtracted);
-
-    // Build position → ExtractedItem maps for later use in comparator.
-    const orderParamsByPos = new Map<number, ExtractedItem>();
-    for (const e of orderExtracted) orderParamsByPos.set(e.position, e);
-    const invoiceParamsByPos = new Map<number, ExtractedItem>();
-    for (const e of invoiceExtracted) invoiceParamsByPos.set(e.position, e);
-
-    console.log(
-      `[comparison] Stage A done: ${orderExtracted.length} order params, ${invoiceExtracted.length} invoice params`
-    );
-
-    updateProgress(comparisonId, 'comparing', 45);
-
-    // ---------- Step 5: LLM comparison (batched) ----------
-    checkCancelled(comparisonId);
-
-    const orderForPrompt: CompareItemInput[] = orderItems.map((item) => ({
-      position: item.position,
-      rawName: item.rawName,
-      unit: item.unit,
-      quantity: item.quantity,
-      params: orderParamsByPos.get(item.position) ?? emptyExtracted(item.position),
+    const orderRaw: RawItemForExtraction[] = orderItems.map((it) => ({
+      position: it.position, rawName: it.rawName, unit: it.unit, quantity: it.quantity,
+    }));
+    const invoiceRaw: RawItemForExtraction[] = invoiceItems.map((it) => ({
+      position: it.position, rawName: it.rawName, unit: it.unit, quantity: it.quantity,
     }));
 
-    const invoiceForPrompt: CompareItemInput[] = invoiceItems.map((item) => ({
-      position: item.position,
-      rawName: item.rawName,
-      unit: item.unit,
-      quantity: item.quantity,
-      unitPrice: item.unitPrice,
-      totalPrice: item.totalPrice,
-      params: invoiceParamsByPos.get(item.position) ?? emptyExtracted(item.position),
-    }));
-
-    const BATCH_SIZE = 15;
-    const orderBatches: CompareItemInput[][] = [];
-    for (let i = 0; i < orderForPrompt.length; i += BATCH_SIZE) {
-      orderBatches.push(orderForPrompt.slice(i, i + BATCH_SIZE));
-    }
-
-    console.log(
-      `[comparison] Splitting ${orderItems.length} order items into ${orderBatches.length} batch(es) ` +
-      `(batch size: ${BATCH_SIZE}) against ${invoiceItems.length} invoice items`
-    );
-
-    // Accumulate results from all batches
-    const mergedResult: ComparisonLLMResult = {
-      matched_items: [],
-      unmatched_order: [],
-      unmatched_invoice: [],
-      summary: { total_order: 0, total_invoice: 0, matched: 0, unmatched_order: 0, unmatched_invoice: 0, critical_mismatches: 0, warnings: 0 },
-    };
-
-    // Track which invoice positions have been matched so far
-    const matchedInvoicePositions = new Set<number>();
-
-    for (let batchIdx = 0; batchIdx < orderBatches.length; batchIdx++) {
-      checkCancelled(comparisonId);
-
-      const batch = orderBatches[batchIdx]!;
-
-      // Filter out already-matched invoice items for subsequent batches
-      const availableInvoice = batchIdx === 0
-        ? invoiceForPrompt
-        : invoiceForPrompt.filter((item) => !matchedInvoicePositions.has(item.position));
-
-      console.log(
-        `[comparison] Batch ${batchIdx + 1}/${orderBatches.length}: ` +
-        `${batch.length} order items vs ${availableInvoice.length} invoice items`
-      );
-
-      const { systemPrompt, userMessage } = buildComparePrompt(batch, availableInvoice);
-
-      const llmResponse = await callOpenRouter({
-        model: config.OPENROUTER_MODEL_COMPARE,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.1,
-        responseFormat: { type: 'json_object' },
-        signal: controller.signal,
-      });
-
-      const batchResult = parseJsonResponse(llmResponse);
-
-      // Merge matched items and track matched invoice positions
-      for (const match of batchResult.matched_items ?? []) {
-        mergedResult.matched_items.push(match);
-        matchedInvoicePositions.add(match.invoice_row);
-      }
-
-      // Merge unmatched order items
-      for (const item of batchResult.unmatched_order ?? []) {
-        mergedResult.unmatched_order.push(item);
-      }
-
-      // Progress: 45% → 90% spread across batches
-      const batchProgress = 45 + Math.round(((batchIdx + 1) / orderBatches.length) * 45);
-      updateProgress(comparisonId, 'comparing', batchProgress);
-
-      console.log(
-        `[comparison] Batch ${batchIdx + 1} done: ${batchResult.matched_items?.length ?? 0} matched, ` +
-        `${batchResult.unmatched_order?.length ?? 0} unmatched order`
-      );
-    }
-
-    checkCancelled(comparisonId);
-
-    // Determine unmatched invoice items (not matched in any batch)
-    for (const item of invoiceForPrompt) {
-      if (!matchedInvoicePositions.has(item.position)) {
-        mergedResult.unmatched_invoice.push({
-          invoice_row: item.position,
-          invoice_name: item.rawName,
-          reason: 'Не найдено соответствие в заказе',
-        });
-      }
-    }
-
-    // ---------- Step 5.5: Stage B — Deterministic comparison ----------
-    // Walk through every LLM-suggested matched pair, run deterministic comparator
-    // on the structured params. Reject pairs where category/shape doesn't fit;
-    // override parameter_mismatches and confidence with deterministic results.
-    updateProgress(comparisonId, 'comparing', 88);
-    console.log(`[comparison] Stage B: deterministic comparison of ${mergedResult.matched_items.length} pairs`);
-
-    const decisions = new Map<number, CompareDecision>(); // key: order_row
-    const survivors: typeof mergedResult.matched_items = [];
-
-    for (const match of mergedResult.matched_items) {
-      const orderParams = orderParamsByPos.get(match.order_row);
-      const invoiceParams = invoiceParamsByPos.get(match.invoice_row);
-      if (!orderParams || !invoiceParams) {
-        // No params extracted — keep LLM verdict as-is, no override.
-        survivors.push(match);
-        continue;
-      }
-
-      const decision = compareItems(orderParams, invoiceParams);
-
-      if (!decision.isMatch) {
-        // Reject: move both sides back to unmatched.
-        const orderItem = orderItems.find((it) => it.position === match.order_row);
-        const invoiceItem = invoiceItems.find((it) => it.position === match.invoice_row);
-        const reason = decision.rejectReason ?? 'Параметры не совпадают';
-        if (orderItem) {
-          mergedResult.unmatched_order.push({
-            order_row: orderItem.position,
-            order_name: orderItem.rawName,
-            reason: `Stage B: ${reason}`,
-          });
-        }
-        if (invoiceItem) {
-          mergedResult.unmatched_invoice.push({
-            invoice_row: invoiceItem.position,
-            invoice_name: invoiceItem.rawName,
-            reason: `Stage B: ${reason}`,
-          });
-        }
-        console.log(`[comparison] Stage B reject: order#${match.order_row} ↔ invoice#${match.invoice_row} — ${reason}`);
-        continue;
-      }
-
-      // Override LLM-supplied mismatches/confidence with deterministic results.
-      match.parameter_mismatches = decision.mismatches.map((m) => ({
-        parameter: m.parameter,
-        order_value: m.order_value,
-        invoice_value: m.invoice_value,
-        severity: m.severity,
-      }));
-      match.match_confidence = decision.confidence;
-
-      decisions.set(match.order_row, decision);
-      survivors.push(match);
-    }
-
-    mergedResult.matched_items = survivors;
-
-    // Rebuild summary: counts are number of PAIRS in each status, not raw mismatch counts.
-    // This way the summary cards in the UI align 1-to-1 with status badges.
-    const statusBreakdown = { matched: 0, partial: 0, mismatch: 0 };
-    for (const m of mergedResult.matched_items) {
-      const d = decisions.get(m.order_row);
-      if (d) statusBreakdown[d.derivedStatus]++;
-      else statusBreakdown.matched++; // fallback for pairs without params
-    }
-
-    mergedResult.summary = {
-      total_order: orderForPrompt.length,
-      total_invoice: invoiceForPrompt.length,
-      matched: statusBreakdown.matched,
-      unmatched_order: mergedResult.unmatched_order.length,
-      unmatched_invoice: mergedResult.unmatched_invoice.length,
-      critical_mismatches: statusBreakdown.mismatch,
-      warnings: statusBreakdown.partial,
-    };
-
-    console.log(
-      `[comparison] All batches done: ${mergedResult.summary.matched} pairs ` +
-      `(${statusBreakdown.matched} matched / ${statusBreakdown.partial} partial / ${statusBreakdown.mismatch} mismatch), ` +
-      `${mergedResult.summary.unmatched_order} unmatched order, ` +
-      `${mergedResult.summary.unmatched_invoice} unmatched invoice`
-    );
-
-    const comparisonResult = mergedResult;
-    const finalDecisions = decisions;
-
-    // ---------- Step 6: Save results ----------
-    const insertResult = db.prepare(`
-      INSERT INTO comparison_results (
-        comparison_id, order_item_id, invoice_item_id,
-        match_status, match_confidence,
-        quantity_status, quantity_diff_pct, conversion_note,
-        discrepancies_json, reasoning
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const saveResults = db.transaction(() => {
-      // Save matched items
-      for (const match of comparisonResult.matched_items ?? []) {
-        const orderItemId = orderPositionToId.get(match.order_row) ?? null;
-        const invoiceItemId = invoicePositionToId.get(match.invoice_row) ?? null;
-
-        const discrepancies = match.parameter_mismatches?.length
-          ? JSON.stringify(match.parameter_mismatches)
-          : null;
-
-        // Status is derived from severity of deterministic mismatches.
-        // Fallback to 'matched' for pairs that bypassed Stage B (no params extracted).
-        const decision = finalDecisions.get(match.order_row);
-        const matchStatus = decision?.derivedStatus ?? 'matched';
-
-        insertResult.run(
-          comparisonId,
-          orderItemId,
-          invoiceItemId,
-          matchStatus,
-          match.match_confidence,
-          match.quantity_comparison?.status ?? null,
-          match.quantity_comparison?.difference_pct ?? null,
-          match.quantity_comparison?.conversion_note ?? null,
-          discrepancies,
-          match.match_reasoning
-        );
-      }
-
-      // Save unmatched order items
-      for (const item of comparisonResult.unmatched_order ?? []) {
-        const orderItemId = orderPositionToId.get(item.order_row) ?? null;
-
-        insertResult.run(
-          comparisonId,
-          orderItemId,
-          null,
-          'unmatched_order',
-          null,
-          null,
-          null,
-          null,
-          null,
-          item.reason
-        );
-      }
-
-      // Save unmatched invoice items
-      for (const item of comparisonResult.unmatched_invoice ?? []) {
-        const invoiceItemId = invoicePositionToId.get(item.invoice_row) ?? null;
-
-        insertResult.run(
-          comparisonId,
-          null,
-          invoiceItemId,
-          'unmatched_invoice',
-          null,
-          null,
-          null,
-          null,
-          null,
-          item.reason
-        );
-      }
+    const orderExtracted = await extractParameters(orderRaw, {
+      comparisonId,
+      side: 'order',
+      signal: controller.signal,
+      onItemDone: (item) => {
+        persistOneItem(comparisonId, 'order_items', orderPositionToId, item);
+        bumpStageADone(comparisonId);
+      },
+      onItemFailed: (item, error) => {
+        persistOneItem(comparisonId, 'order_items', orderPositionToId, item);
+        bumpStageADone(comparisonId);
+        markStageAFailure(comparisonId, 'order', item.position, error.message);
+      },
     });
-    saveResults();
 
-    updateProgress(comparisonId, 'done', 95);
+    const invoiceExtracted = await extractParameters(invoiceRaw, {
+      comparisonId,
+      side: 'invoice',
+      signal: controller.signal,
+      onItemDone: (item) => {
+        persistOneItem(comparisonId, 'invoice_items', invoicePositionToId, item);
+        bumpStageADone(comparisonId);
+      },
+      onItemFailed: (item, error) => {
+        persistOneItem(comparisonId, 'invoice_items', invoicePositionToId, item);
+        bumpStageADone(comparisonId);
+        markStageAFailure(comparisonId, 'invoice', item.position, error.message);
+      },
+    });
 
-    // ---------- Step 7: Save summary and mark done ----------
-    db.prepare('UPDATE comparisons SET summary_json = ?, status = ?, progress = ? WHERE id = ?').run(
-      JSON.stringify(comparisonResult.summary ?? {}),
-      'done',
-      100,
-      comparisonId
-    );
+    dumpJson(comparisonId, 'stage_a/order/_summary.json', orderExtracted);
+    dumpJson(comparisonId, 'stage_a/invoice/_summary.json', invoiceExtracted);
 
-    console.log(`[comparison] Completed comparison ${comparisonId}`);
+    db.prepare(
+      "UPDATE comparisons SET status = 'awaiting_method', progress = 50, stage_a_completed_at = datetime('now') WHERE id = ?"
+    ).run(comparisonId);
 
+    console.log(`[comparison] ${comparisonId} Stage A done — awaiting method selection`);
   } catch (err) {
-    if (err instanceof CancellationError) {
-      console.log(`[comparison] Cancelled: ${comparisonId}`);
-    } else {
-      const cancelledRow = getDb().prepare('SELECT cancelled_at FROM comparisons WHERE id = ?').get(comparisonId) as { cancelled_at: string | null } | undefined;
-      const isTimeout = err instanceof Error && err.name === 'AbortError' && !cancelledRow?.cancelled_at;
-      const message = isTimeout
-        ? `Превышено максимальное время обработки (${Math.round(PIPELINE_TIMEOUT_MS / 60000)} мин)`
-        : err instanceof Error ? err.message : String(err);
-      console.error(`[comparison] Error for ${comparisonId}:`, message);
-
-      db.prepare('UPDATE comparisons SET status = ?, error_message = ? WHERE id = ?').run(
-        'error',
-        message,
-        comparisonId
-      );
-    }
+    handlePipelineError(comparisonId, err);
   } finally {
     clearTimeout(timeoutHandle);
     activeControllers.delete(comparisonId);
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGE B — сравнение выбранным методом
+
 /**
- * Parses a JSON response that may be wrapped in markdown code fences.
+ * Запускается, когда пользователь выбрал метод. Загружает уже извлечённые
+ * params_json из БД и запускает либо fuzzy, либо llm, либо оба.
  */
-function parseJsonResponse(text: string): ComparisonLLMResult {
-  const cleaned = stripMarkdownFences(text);
+export async function runStageB(comparisonId: string, method: ComparisonMethod): Promise<void> {
+  const db = getDb();
+  const controller = new AbortController();
+  activeControllers.set(comparisonId, controller);
+  const timeoutHandle = setTimeout(() => controller.abort(), PIPELINE_TIMEOUT_MS);
 
   try {
-    return JSON.parse(cleaned) as ComparisonLLMResult;
-  } catch {
-    throw new Error(`Failed to parse LLM comparison response as JSON: ${cleaned.slice(0, 300)}`);
+    updateProgress(comparisonId, 'comparing', 55);
+
+    // Зачищаем старые результаты на случай повторного запуска
+    db.prepare('DELETE FROM comparison_results WHERE comparison_id = ?').run(comparisonId);
+
+    const orderRows = db.prepare(
+      'SELECT id, position, raw_name, params_json FROM order_items WHERE comparison_id = ? ORDER BY position'
+    ).all(comparisonId) as Array<{ id: number; position: number; raw_name: string; params_json: string | null }>;
+    const invoiceRows = db.prepare(
+      'SELECT id, position, raw_name, params_json FROM invoice_items WHERE comparison_id = ? ORDER BY position'
+    ).all(comparisonId) as Array<{ id: number; position: number; raw_name: string; params_json: string | null }>;
+
+    const orderItems = orderRows.map((r) => parseParamsJson(r.params_json, r.position));
+    const invoiceItems = invoiceRows.map((r) => parseParamsJson(r.params_json, r.position));
+
+    const orderPosToId = new Map(orderRows.map((r) => [r.position, r.id]));
+    const invoicePosToId = new Map(invoiceRows.map((r) => [r.position, r.id]));
+
+    let fuzzyMatches: MatchPair[] = [];
+    let llmMatches: MatchPair[] = [];
+
+    if (method === 'fuzzy' || method === 'both') {
+      checkCancelled(comparisonId);
+      fuzzyMatches = matchFuzzy(orderItems, invoiceItems, { comparisonId });
+      updateProgress(comparisonId, 'comparing', method === 'both' ? 70 : 88);
+    }
+
+    if (method === 'llm' || method === 'both') {
+      checkCancelled(comparisonId);
+      llmMatches = await matchLlm(orderItems, invoiceItems, { comparisonId, signal: controller.signal });
+      updateProgress(comparisonId, 'comparing', 88);
+    }
+
+    if (method === 'both') {
+      const reconcile = buildReconcile(fuzzyMatches, llmMatches);
+      dumpJson(comparisonId, 'stage_b/both/reconcile.json', reconcile);
+      console.log(
+        `[stage-b:both] ${comparisonId} reconcile: ${reconcile.agree} agree, ${reconcile.disagree} disagree`
+      );
+    }
+
+    // ---------- Запись результатов в comparison_results ----------
+    const insertResult = db.prepare(`
+      INSERT INTO comparison_results (
+        comparison_id, order_item_id, invoice_item_id,
+        match_status, match_confidence,
+        quantity_status, quantity_diff_pct, conversion_note,
+        discrepancies_json, reasoning, method
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const writeBatch = (matches: MatchPair[], methodTag: string): void => {
+      const usedInvoice = new Set<number>();
+      for (const m of matches) {
+        const orderItemId = orderPosToId.get(m.orderPosition) ?? null;
+        if (m.invoicePosition != null) {
+          const invoiceItemId = invoicePosToId.get(m.invoicePosition) ?? null;
+          if (invoiceItemId != null) usedInvoice.add(invoiceItemId);
+          const status = m.decision?.derivedStatus ?? 'matched';
+          const discrepancies = m.decision?.mismatches.length
+            ? JSON.stringify(m.decision.mismatches.map((mm) => ({
+                parameter: mm.parameter,
+                order_value: mm.order_value,
+                invoice_value: mm.invoice_value,
+                severity: mm.severity,
+              })))
+            : null;
+          insertResult.run(
+            comparisonId, orderItemId, invoiceItemId,
+            status, m.confidence,
+            null, null, null,
+            discrepancies, m.reasoning, methodTag
+          );
+        } else {
+          insertResult.run(
+            comparisonId, orderItemId, null,
+            'unmatched_order', null,
+            null, null, null,
+            null, m.reasoning, methodTag
+          );
+        }
+      }
+      // unmatched invoices
+      for (const invRow of invoiceRows) {
+        if (!usedInvoice.has(invRow.id)) {
+          insertResult.run(
+            comparisonId, null, invRow.id,
+            'unmatched_invoice', null,
+            null, null, null,
+            null, 'Не найдено соответствие в заказе', methodTag
+          );
+        }
+      }
+    };
+
+    db.transaction(() => {
+      if (method === 'fuzzy') writeBatch(fuzzyMatches, 'single');
+      else if (method === 'llm') writeBatch(llmMatches, 'single');
+      else {
+        writeBatch(fuzzyMatches, 'fuzzy');
+        writeBatch(llmMatches, 'llm');
+      }
+    })();
+
+    // ---------- Сводка ----------
+    const summary = buildSummary(method, orderItems.length, invoiceItems.length, fuzzyMatches, llmMatches);
+
+    db.prepare(
+      'UPDATE comparisons SET summary_json = ?, status = ?, progress = ?, comparison_method = ? WHERE id = ?'
+    ).run(JSON.stringify(summary), 'done', 100, method, comparisonId);
+
+    console.log(`[comparison] ${comparisonId} Stage B (${method}) done`);
+  } catch (err) {
+    handlePipelineError(comparisonId, err);
+  } finally {
+    clearTimeout(timeoutHandle);
+    activeControllers.delete(comparisonId);
   }
 }
 
-/**
- * Strips markdown code fences from LLM response.
- * Handles both closed (```json ... ```) and unclosed (```json ... EOF) fences.
- */
-function stripMarkdownFences(text: string): string {
-  let cleaned = text.trim();
+// ─────────────────────────────────────────────────────────────────────────────
+// Backwards-compat: старое имя из routes.
 
-  // Try closed fence first (greedy to match the last closing ```)
-  const closedFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)\n\s*```\s*$/);
-  if (closedFence) {
-    return closedFence[1]!.trim();
-  }
-
-  // Unclosed fence (response truncated — no closing ```)
-  const openFence = cleaned.match(/^```(?:json)?\s*\n([\s\S]*)$/);
-  if (openFence) {
-    return openFence[1]!.trim();
-  }
-
-  return cleaned;
+export async function startComparison(comparisonId: string): Promise<void> {
+  return runStageA(comparisonId);
 }
 
-// ─── Stage A helpers ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Retry одной позиции Stage A
 
-/** Возвращает пустой ExtractedItem-плейсхолдер для позиции (fallback). */
-function emptyExtracted(position: number): ExtractedItem {
-  return {
+export async function retryStageAItem(
+  comparisonId: string,
+  side: 'order' | 'invoice',
+  position: number
+): Promise<{ success: boolean; error?: string }> {
+  const db = getDb();
+  const table = side === 'order' ? 'order_items' : 'invoice_items';
+  const row = db.prepare(
+    `SELECT id, position, raw_name, quantity, unit FROM ${table} WHERE comparison_id = ? AND position = ?`
+  ).get(comparisonId, position) as { id: number; position: number; raw_name: string; quantity: number; unit: string } | undefined;
+  if (!row) return { success: false, error: 'Позиция не найдена' };
+
+  const { item, ok, error } = await extractSingleParameter(
+    { position: row.position, rawName: row.raw_name, unit: row.unit, quantity: row.quantity },
+    { comparisonId, side, dumpName: `retry_${String(row.position).padStart(3, '0')}_${Date.now()}` }
+  );
+
+  persistOneItem(comparisonId, table, new Map([[row.position, row.id]]), item);
+
+  if (ok) {
+    db.prepare(
+      'UPDATE comparisons SET stage_a_failed_position = NULL, stage_a_failed_side = NULL, stage_a_error = NULL WHERE id = ? AND stage_a_failed_position = ? AND stage_a_failed_side = ?'
+    ).run(comparisonId, position, side);
+    return { success: true };
+  } else {
+    return { success: false, error: error?.message ?? 'unknown error' };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// helpers
+
+function pickGost(item: ExtractedItem): string | null {
+  const std = item.standards ?? {};
+  for (const k of ['gost', 'tu', 'sto']) {
+    const v = std[k];
+    if (v != null && v !== '') return String(v);
+  }
+  return null;
+}
+
+function persistOneItem(
+  comparisonId: string,
+  table: 'order_items' | 'invoice_items',
+  positionToId: Map<number, number>,
+  item: ExtractedItem
+): void {
+  const id = positionToId.get(item.position);
+  if (id == null) return;
+  const materialType = item.type ?? item.category ?? null;
+  const gost = pickGost(item);
+  getDb().prepare(
+    `UPDATE ${table} SET material_type = ?, gost = ?, params_json = ? WHERE id = ?`
+  ).run(materialType, gost, JSON.stringify(item), id);
+}
+
+function bumpStageADone(comparisonId: string): void {
+  getDb().prepare(
+    'UPDATE comparisons SET stage_a_done = stage_a_done + 1 WHERE id = ?'
+  ).run(comparisonId);
+}
+
+function markStageAFailure(
+  comparisonId: string,
+  side: 'order' | 'invoice',
+  position: number,
+  errorMessage: string
+): void {
+  getDb().prepare(
+    'UPDATE comparisons SET stage_a_failed_position = ?, stage_a_failed_side = ?, stage_a_error = ? WHERE id = ?'
+  ).run(position, side, errorMessage.slice(0, 500), comparisonId);
+}
+
+function parseParamsJson(json: string | null, position: number): ExtractedItem {
+  const fallback: ExtractedItem = {
     position,
     category: 'other',
     type: null,
@@ -655,41 +460,108 @@ function emptyExtracted(position: number): ExtractedItem {
     standards: {},
     extra: {},
   };
-}
-
-/**
- * Сохраняет извлечённые параметры в БД (поля material_type, gost, params_json).
- * Эти поля уже существуют в schema.sql, но раньше не заполнялись.
- */
-function persistExtractedParams(
-  db: ReturnType<typeof getDb>,
-  table: 'order_items' | 'invoice_items',
-  positionToId: Map<number, number>,
-  extracted: ExtractedItem[]
-): void {
-  const update = db.prepare(
-    `UPDATE ${table} SET material_type = ?, gost = ?, params_json = ? WHERE id = ?`
-  );
-
-  const tx = db.transaction(() => {
-    for (const item of extracted) {
-      const id = positionToId.get(item.position);
-      if (id == null) continue;
-      const materialType = item.type ?? item.category ?? null;
-      const gost = pickGost(item);
-      update.run(materialType, gost, JSON.stringify(item), id);
-    }
-  });
-  tx();
-}
-
-/** Извлекает значение ГОСТ/ТУ из standards для отдельной колонки. */
-function pickGost(item: ExtractedItem): string | null {
-  const std = item.standards ?? {};
-  const candidates = ['gost', 'tu', 'sto'];
-  for (const key of candidates) {
-    const v = std[key];
-    if (v != null && v !== '') return String(v);
+  if (!json) return fallback;
+  try {
+    const parsed = JSON.parse(json) as ExtractedItem;
+    return { ...parsed, position };
+  } catch {
+    return fallback;
   }
-  return null;
+}
+
+interface ReconcileEntry {
+  orderPosition: number;
+  fuzzyInvoicePosition: number | null;
+  llmInvoicePosition: number | null;
+  agree: boolean;
+}
+
+interface ReconcileSummary {
+  agree: number;
+  disagree: number;
+  entries: ReconcileEntry[];
+}
+
+function buildReconcile(fuzzy: MatchPair[], llm: MatchPair[]): ReconcileSummary {
+  const fuzzyMap = new Map(fuzzy.map((m) => [m.orderPosition, m.invoicePosition]));
+  const llmMap = new Map(llm.map((m) => [m.orderPosition, m.invoicePosition]));
+  const allOrders = new Set<number>([...fuzzyMap.keys(), ...llmMap.keys()]);
+  let agree = 0;
+  let disagree = 0;
+  const entries: ReconcileEntry[] = [];
+  for (const op of allOrders) {
+    const f = fuzzyMap.get(op) ?? null;
+    const l = llmMap.get(op) ?? null;
+    const same = f === l;
+    if (same) agree++;
+    else disagree++;
+    entries.push({ orderPosition: op, fuzzyInvoicePosition: f, llmInvoicePosition: l, agree: same });
+  }
+  return { agree, disagree, entries: entries.sort((a, b) => a.orderPosition - b.orderPosition) };
+}
+
+interface SummaryV2 {
+  total_order: number;
+  total_invoice: number;
+  matched: number;
+  unmatched_order: number;
+  unmatched_invoice: number;
+  critical_mismatches: number;
+  warnings: number;
+  method: ComparisonMethod;
+}
+
+function buildSummary(
+  method: ComparisonMethod,
+  totalOrder: number,
+  totalInvoice: number,
+  fuzzy: MatchPair[],
+  llm: MatchPair[]
+): SummaryV2 {
+  // Для both — берём LLM как «основной» источник для сводки.
+  const primary = method === 'fuzzy' ? fuzzy : llm.length > 0 ? llm : fuzzy;
+
+  let matched = 0;
+  let critical = 0;
+  let warnings = 0;
+  let unmatchedOrder = 0;
+  for (const m of primary) {
+    if (m.invoicePosition == null) {
+      unmatchedOrder++;
+      continue;
+    }
+    const status = m.decision?.derivedStatus ?? 'matched';
+    if (status === 'matched') matched++;
+    else if (status === 'partial') warnings++;
+    else critical++;
+  }
+
+  const used = new Set(primary.filter((m) => m.invoicePosition != null).map((m) => m.invoicePosition!));
+  const unmatchedInvoice = totalInvoice - used.size;
+
+  return {
+    total_order: totalOrder,
+    total_invoice: totalInvoice,
+    matched,
+    unmatched_order: unmatchedOrder,
+    unmatched_invoice: unmatchedInvoice,
+    critical_mismatches: critical,
+    warnings,
+    method,
+  };
+}
+
+function handlePipelineError(comparisonId: string, err: unknown): void {
+  if (err instanceof CancellationError) {
+    console.log(`[comparison] Cancelled: ${comparisonId}`);
+    return;
+  }
+  const cancelledRow = getDb().prepare('SELECT cancelled_at FROM comparisons WHERE id = ?').get(comparisonId) as { cancelled_at: string | null } | undefined;
+  const isTimeout = err instanceof Error && err.name === 'AbortError' && !cancelledRow?.cancelled_at;
+  const message = isTimeout
+    ? `Превышено максимальное время обработки (${Math.round(PIPELINE_TIMEOUT_MS / 60000)} мин)`
+    : err instanceof Error ? err.message : String(err);
+  console.error(`[comparison] Error for ${comparisonId}:`, message);
+  getDb().prepare('UPDATE comparisons SET status = ?, error_message = ? WHERE id = ?')
+    .run('error', message, comparisonId);
 }

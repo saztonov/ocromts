@@ -28,10 +28,37 @@ export function runMigrations(): void {
   if (!colNames.has('cancelled_at')) {
     db.exec("ALTER TABLE comparisons ADD COLUMN cancelled_at TEXT");
   }
+  if (!colNames.has('comparison_method')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN comparison_method TEXT");
+  }
+  if (!colNames.has('stage_a_total')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN stage_a_total INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!colNames.has('stage_a_done')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN stage_a_done INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!colNames.has('stage_a_failed_position')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN stage_a_failed_position INTEGER");
+  }
+  if (!colNames.has('stage_a_failed_side')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN stage_a_failed_side TEXT");
+  }
+  if (!colNames.has('stage_a_error')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN stage_a_error TEXT");
+  }
+  if (!colNames.has('stage_a_completed_at')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN stage_a_completed_at TEXT");
+  }
+
+  const resultColumns = db.prepare("PRAGMA table_info(comparison_results)").all() as { name: string }[];
+  const resultColNames = new Set(resultColumns.map((c) => c.name));
+  if (!resultColNames.has('method')) {
+    db.exec("ALTER TABLE comparison_results ADD COLUMN method TEXT NOT NULL DEFAULT 'single'");
+  }
 
   // Clean up comparisons stuck in processing state (e.g. server crashed mid-comparison)
   const stuck = db.prepare(
-    "UPDATE comparisons SET status = 'error', error_message = 'Обработка прервана перезапуском сервера' WHERE status IN ('parsing', 'comparing')"
+    "UPDATE comparisons SET status = 'error', error_message = 'Обработка прервана перезапуском сервера' WHERE status IN ('parsing', 'comparing', 'extracting', 'awaiting_method')"
   ).run();
   if (stuck.changes > 0) {
     console.log(`[migrations] Reset ${stuck.changes} stuck comparison(s) to error`);

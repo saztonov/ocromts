@@ -1,8 +1,8 @@
 import { useState, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { getComparison, cancelComparison } from '../api/client';
-import type { MatchStatus, ComparisonSummary } from '../types';
+import { getComparison, cancelComparison, startCompareWithMethod, retryStageAItem } from '../api/client';
+import type { MatchStatus, ComparisonSummary, ComparisonMethod } from '../types';
 import SummaryBar from '../components/comparison/SummaryBar';
 import FilterTabs from '../components/comparison/FilterTabs';
 import ComparisonTable from '../components/comparison/ComparisonTable';
@@ -22,8 +22,9 @@ export default function ComparisonPage() {
     enabled: !!id,
     refetchInterval: (query) => {
       const status = query.state.data?.comparison.status;
+      if (status === 'awaiting_method') return 5000;
       if (status && !['done', 'error', 'cancelled'].includes(status)) {
-        return 2000;
+        return 1500;
       }
       return false;
     },
@@ -53,7 +54,42 @@ export default function ComparisonPage() {
     return c;
   }, [results]);
 
-  const isPending = comparison?.status === 'pending' || comparison?.status === 'parsing' || comparison?.status === 'comparing';
+  const isPending = comparison?.status === 'pending'
+    || comparison?.status === 'parsing'
+    || comparison?.status === 'extracting'
+    || comparison?.status === 'comparing';
+
+  const [chosenMethod, setChosenMethod] = useState<ComparisonMethod>('llm');
+  const [isStartingCompare, setIsStartingCompare] = useState(false);
+  const [retrying, setRetrying] = useState<string | null>(null);
+
+  const handleStartCompare = async () => {
+    if (!id) return;
+    setIsStartingCompare(true);
+    try {
+      await startCompareWithMethod(id, chosenMethod);
+      queryClient.invalidateQueries({ queryKey: ['comparison', id] });
+    } catch (e) {
+      console.error('Start compare failed:', e);
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsStartingCompare(false);
+    }
+  };
+
+  const handleRetry = async (side: 'order' | 'invoice', position: number) => {
+    if (!id) return;
+    const key = `${side}-${position}`;
+    setRetrying(key);
+    try {
+      await retryStageAItem(id, side, position);
+      queryClient.invalidateQueries({ queryKey: ['comparison', id] });
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetrying(null);
+    }
+  };
 
   const handleCancel = async () => {
     if (!id) return;
@@ -154,6 +190,9 @@ export default function ComparisonPage() {
               <p className="mt-4 text-base font-medium text-slate-700">
                 {comparison.status === 'pending' && 'Ожидание в очереди...'}
                 {comparison.status === 'parsing' && 'Анализ документов...'}
+                {comparison.status === 'extracting' && (
+                  <>Извлечение параметров (Stage A): {comparison.stage_a_done} / {comparison.stage_a_total}</>
+                )}
                 {comparison.status === 'comparing' && 'Сравнение позиций...'}
               </p>
               <div className="mt-4 w-full max-w-xs">
@@ -236,6 +275,82 @@ export default function ComparisonPage() {
             </div>
           )}
 
+          {/* Live Stage A tables — visible during extraction and after */}
+          {(comparison.status === 'extracting' || comparison.status === 'awaiting_method') && (
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <StageALiveTable
+                title={`Заказ (${orderItems.length})`}
+                items={orderItems}
+                side="order"
+                failedPosition={comparison.stage_a_failed_side === 'order' ? comparison.stage_a_failed_position : null}
+                onRetry={handleRetry}
+                retryingKey={retrying}
+              />
+              <StageALiveTable
+                title={`Счёт (${invoiceItems.length})`}
+                items={invoiceItems}
+                side="invoice"
+                failedPosition={comparison.stage_a_failed_side === 'invoice' ? comparison.stage_a_failed_position : null}
+                onRetry={handleRetry}
+                retryingKey={retrying}
+              />
+            </div>
+          )}
+
+          {/* Awaiting method — method picker */}
+          {comparison.status === 'awaiting_method' && (
+            <div className="rounded-xl border border-slate-200 bg-white shadow-sm p-6 space-y-4">
+              <div>
+                <h2 className="text-lg font-semibold text-slate-900">Stage A завершён</h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  Параметры извлечены. Выберите метод сравнения двух документов.
+                </p>
+              </div>
+
+              {comparison.stage_a_failed_position != null && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                  Внимание: при разборе позиции {comparison.stage_a_failed_side === 'order' ? 'заказа' : 'счёта'} #{comparison.stage_a_failed_position} произошла ошибка
+                  ({comparison.stage_a_error ?? 'неизвестная'}). Можно повторить её через кнопку «Повторить» или продолжить как есть.
+                </div>
+              )}
+
+              <div className="space-y-2">
+                {(['fuzzy', 'llm', 'both'] as ComparisonMethod[]).map((m) => (
+                  <label key={m} className="flex cursor-pointer items-start gap-3 rounded-lg border border-slate-200 p-3 hover:bg-slate-50">
+                    <input
+                      type="radio"
+                      name="method"
+                      value={m}
+                      checked={chosenMethod === m}
+                      onChange={() => setChosenMethod(m)}
+                      className="mt-1"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-slate-900">
+                        {m === 'fuzzy' && 'Fuzzy-поиск (Fuse.js + детерминированная валидация)'}
+                        {m === 'llm' && 'LLM-сравнение (один вызов на оба документа целиком)'}
+                        {m === 'both' && 'Оба метода + сверка'}
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        {m === 'fuzzy' && 'Быстро, без затрат на LLM. Хорош на простых случаях.'}
+                        {m === 'llm' && 'Медленнее и дороже, но видит семантику и нестандартные сокращения.'}
+                        {m === 'both' && 'Запускает оба метода независимо и подсвечивает расхождения.'}
+                      </div>
+                    </div>
+                  </label>
+                ))}
+              </div>
+
+              <button
+                onClick={handleStartCompare}
+                disabled={isStartingCompare}
+                className="inline-flex items-center gap-1.5 px-5 py-2.5 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isStartingCompare ? 'Запуск...' : 'Запустить сравнение'}
+              </button>
+            </div>
+          )}
+
           {/* Done state — results */}
           {comparison.status === 'done' && (
             <>
@@ -255,6 +370,75 @@ export default function ComparisonPage() {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface StageALiveTableProps {
+  title: string;
+  items: Array<{ position: number; raw_name: string; params_json: { category: string; shape?: string | null; type?: string | null; geometry?: Record<string, unknown> } | null }>;
+  side: 'order' | 'invoice';
+  failedPosition: number | null;
+  onRetry: (side: 'order' | 'invoice', position: number) => void;
+  retryingKey: string | null;
+}
+
+function StageALiveTable({ title, items, side, failedPosition, onRetry, retryingKey }: StageALiveTableProps) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+      <div className="px-4 py-3 border-b border-slate-200 bg-slate-50">
+        <h3 className="text-sm font-semibold text-slate-900">{title}</h3>
+      </div>
+      <div className="max-h-[480px] overflow-y-auto">
+        <table className="min-w-full text-xs">
+          <thead className="bg-slate-50 sticky top-0">
+            <tr className="text-left text-slate-500">
+              <th className="px-3 py-2 font-medium">№</th>
+              <th className="px-3 py-2 font-medium">Наименование</th>
+              <th className="px-3 py-2 font-medium">Категория</th>
+              <th className="px-3 py-2 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {items.map((it) => {
+              const params = it.params_json;
+              const isFailed = failedPosition === it.position || (params?.category === 'other');
+              const isProcessed = params != null;
+              const key = `${side}-${it.position}`;
+              return (
+                <tr key={it.position} className={isFailed ? 'bg-red-50' : isProcessed ? 'bg-emerald-50/30' : ''}>
+                  <td className="px-3 py-2 text-slate-600 align-top">{it.position}</td>
+                  <td className="px-3 py-2 text-slate-800 align-top">{it.raw_name}</td>
+                  <td className="px-3 py-2 text-slate-600 align-top">
+                    {params ? (
+                      <span>
+                        {params.category}
+                        {params.shape ? `/${params.shape}` : ''}
+                        {params.type ? ` · ${params.type}` : ''}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">в очереди…</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 align-top">
+                    {isFailed && (
+                      <button
+                        onClick={() => onRetry(side, it.position)}
+                        disabled={retryingKey === key}
+                        className="text-xs px-2 py-1 rounded border border-red-300 text-red-700 hover:bg-red-100 disabled:opacity-50"
+                      >
+                        {retryingKey === key ? '...' : 'Повторить'}
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getDb } from '../db/connection.js';
 import { config } from '../config.js';
-import { startComparison, cancelComparison } from '../services/comparison.js';
+import { startComparison, cancelComparison, runStageB, retryStageAItem, type ComparisonMethod } from '../services/comparison.js';
 
 // ---- DB row types ---- //
 
@@ -194,6 +194,64 @@ router.get('/:id', (req: Request, res: Response): void => {
     invoice_items: parsedInvoiceItems,
     comparison_results: parsedResults,
   });
+});
+
+/**
+ * POST /api/comparisons/:id/compare
+ * После Stage A пользователь выбирает метод сравнения.
+ * Body: { method: 'fuzzy' | 'llm' | 'both' }
+ */
+router.post('/:id/compare', (req: Request, res: Response): void => {
+  const id = req.params.id as string;
+  const body = req.body as { method?: string };
+  const method = body.method;
+
+  if (!method || !['fuzzy', 'llm', 'both'].includes(method)) {
+    res.status(400).json({ error: 'method должен быть fuzzy | llm | both' });
+    return;
+  }
+
+  const db = getDb();
+  const row = db.prepare('SELECT status FROM comparisons WHERE id = ?').get(id) as { status: string } | undefined;
+  if (!row) {
+    res.status(404).json({ error: 'Comparison not found' });
+    return;
+  }
+  if (row.status !== 'awaiting_method') {
+    res.status(409).json({ error: `Невозможно запустить сравнение из статуса "${row.status}". Ожидается "awaiting_method".` });
+    return;
+  }
+
+  // fire-and-forget
+  runStageB(id, method as ComparisonMethod).catch((err) => {
+    console.error(`[routes] Unhandled error in runStageB ${id}:`, err);
+  });
+
+  res.status(202).json({ id, status: 'comparing', method });
+});
+
+/**
+ * POST /api/comparisons/:id/retry-item
+ * Повторная обработка одной позиции Stage A (при сбое отдельной строки).
+ * Body: { side: 'order' | 'invoice', position: number }
+ */
+router.post('/:id/retry-item', (req: Request, res: Response): void => {
+  const id = req.params.id as string;
+  const body = req.body as { side?: string; position?: number };
+  if (!body.side || !['order', 'invoice'].includes(body.side) || typeof body.position !== 'number') {
+    res.status(400).json({ error: 'side и position обязательны' });
+    return;
+  }
+
+  retryStageAItem(id, body.side as 'order' | 'invoice', body.position)
+    .then((result) => {
+      if (result.success) res.json({ success: true });
+      else res.status(500).json({ error: result.error ?? 'unknown' });
+    })
+    .catch((err) => {
+      console.error(`[routes] retry-item ${id}:`, err);
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    });
 });
 
 /**

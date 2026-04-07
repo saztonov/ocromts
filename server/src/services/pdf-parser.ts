@@ -42,7 +42,7 @@ interface PdfExtractionResult {
  * Parses a PDF invoice by sending it as base64 to a vision-capable LLM
  * and extracting structured material data from the response.
  */
-export async function parsePdf(filePath: string, signal?: AbortSignal): Promise<ParsedItem[]> {
+export async function parsePdf(filePath: string, signal?: AbortSignal, comparisonId?: string): Promise<ParsedItem[]> {
   // Рендерим каждую страницу PDF в PNG локально. scale: 2 ≈ 144 DPI — баланс
   // читаемости таблиц и размера изображения.
   const document = await pdf(filePath, { scale: 2 });
@@ -74,6 +74,9 @@ export async function parsePdf(filePath: string, signal?: AbortSignal): Promise<
     temperature: 0.05,
     responseFormat: { type: 'json_object' },
     signal,
+    dumpContext: comparisonId
+      ? { comparisonId, stage: 'pdf_parse', name: '001' }
+      : undefined,
   });
 
   const parsed = parseJsonResponse(responseText);

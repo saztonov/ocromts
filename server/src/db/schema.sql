@@ -9,7 +9,14 @@ CREATE TABLE IF NOT EXISTS comparisons (
     error_message TEXT,
     cancelled_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    summary_json TEXT
+    summary_json TEXT,
+    comparison_method TEXT,
+    stage_a_total INTEGER NOT NULL DEFAULT 0,
+    stage_a_done INTEGER NOT NULL DEFAULT 0,
+    stage_a_failed_position INTEGER,
+    stage_a_failed_side TEXT,
+    stage_a_error TEXT,
+    stage_a_completed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -49,5 +56,6 @@ CREATE TABLE IF NOT EXISTS comparison_results (
     quantity_diff_pct REAL,
     conversion_note TEXT,
     discrepancies_json TEXT,
-    reasoning TEXT
+    reasoning TEXT,
+    method TEXT NOT NULL DEFAULT 'single'
 );
