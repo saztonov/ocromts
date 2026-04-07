@@ -50,7 +50,6 @@ interface ComparisonRow {
 // ---- Cancellation infrastructure ---- //
 
 const activeControllers = new Map<string, AbortController>();
-const PIPELINE_TIMEOUT_MS = config.PIPELINE_TIMEOUT_MS;
 
 class CancellationError extends Error {
   constructor(message = 'Сверка отменена пользователем') {
@@ -102,8 +101,8 @@ export async function runStageA(comparisonId: string): Promise<void> {
   const controller = new AbortController();
   activeControllers.set(comparisonId, controller);
 
-  const timeoutHandle = setTimeout(() => controller.abort(), PIPELINE_TIMEOUT_MS);
-
+  // Stage A чекпоинтит каждую позицию в БД, поэтому хард-таймаут не нужен —
+  // прервать может только пользователь через cancelComparison.
   try {
     updateProgress(comparisonId, 'parsing', 5);
 
@@ -227,7 +226,6 @@ export async function runStageA(comparisonId: string): Promise<void> {
   } catch (err) {
     handlePipelineError(comparisonId, err);
   } finally {
-    clearTimeout(timeoutHandle);
     activeControllers.delete(comparisonId);
   }
 }
@@ -243,7 +241,6 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
   const db = getDb();
   const controller = new AbortController();
   activeControllers.set(comparisonId, controller);
-  const timeoutHandle = setTimeout(() => controller.abort(), PIPELINE_TIMEOUT_MS);
 
   try {
     updateProgress(comparisonId, 'comparing', 55);
@@ -361,7 +358,6 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
   } catch (err) {
     handlePipelineError(comparisonId, err);
   } finally {
-    clearTimeout(timeoutHandle);
     activeControllers.delete(comparisonId);
   }
 }
@@ -556,11 +552,7 @@ function handlePipelineError(comparisonId: string, err: unknown): void {
     console.log(`[comparison] Cancelled: ${comparisonId}`);
     return;
   }
-  const cancelledRow = getDb().prepare('SELECT cancelled_at FROM comparisons WHERE id = ?').get(comparisonId) as { cancelled_at: string | null } | undefined;
-  const isTimeout = err instanceof Error && err.name === 'AbortError' && !cancelledRow?.cancelled_at;
-  const message = isTimeout
-    ? `Превышено максимальное время обработки (${Math.round(PIPELINE_TIMEOUT_MS / 60000)} мин)`
-    : err instanceof Error ? err.message : String(err);
+  const message = err instanceof Error ? err.message : String(err);
   console.error(`[comparison] Error for ${comparisonId}:`, message);
   getDb().prepare('UPDATE comparisons SET status = ?, error_message = ? WHERE id = ?')
     .run('error', message, comparisonId);
