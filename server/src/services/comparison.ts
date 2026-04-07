@@ -96,7 +96,7 @@ export function cancelComparison(comparisonId: string): boolean {
  * По завершении статус → 'awaiting_method'. Пользователь должен явно выбрать
  * метод сравнения через POST /api/comparisons/:id/compare.
  */
-export async function runStageA(comparisonId: string): Promise<void> {
+export async function runStageA(comparisonId: string, options?: { batchConcurrency?: number }): Promise<void> {
   const db = getDb();
   const controller = new AbortController();
   activeControllers.set(comparisonId, controller);
@@ -185,10 +185,11 @@ export async function runStageA(comparisonId: string): Promise<void> {
       position: it.position, rawName: it.rawName, unit: it.unit, quantity: it.quantity,
     }));
 
-    const orderExtracted = await extractParameters(orderRaw, {
+    const orderTask = extractParameters(orderRaw, {
       comparisonId,
       side: 'order',
       signal: controller.signal,
+      batchConcurrency: options?.batchConcurrency,
       onItemDone: (item) => {
         persistOneItem(comparisonId, 'order_items', orderPositionToId, item);
         bumpStageADone(comparisonId);
@@ -200,10 +201,11 @@ export async function runStageA(comparisonId: string): Promise<void> {
       },
     });
 
-    const invoiceExtracted = await extractParameters(invoiceRaw, {
+    const invoiceTask = extractParameters(invoiceRaw, {
       comparisonId,
       side: 'invoice',
       signal: controller.signal,
+      batchConcurrency: options?.batchConcurrency,
       onItemDone: (item) => {
         persistOneItem(comparisonId, 'invoice_items', invoicePositionToId, item);
         bumpStageADone(comparisonId);
@@ -214,6 +216,10 @@ export async function runStageA(comparisonId: string): Promise<void> {
         markStageAFailure(comparisonId, 'invoice', item.position, error.message);
       },
     });
+
+    const [orderExtracted, invoiceExtracted] = config.EXTRACT_SIDES_PARALLEL
+      ? await Promise.all([orderTask, invoiceTask])
+      : [await orderTask, await invoiceTask];
 
     dumpJson(comparisonId, 'stage_a/order/_summary.json', orderExtracted);
     dumpJson(comparisonId, 'stage_a/invoice/_summary.json', invoiceExtracted);
@@ -365,8 +371,8 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
 // ─────────────────────────────────────────────────────────────────────────────
 // Backwards-compat: старое имя из routes.
 
-export async function startComparison(comparisonId: string): Promise<void> {
-  return runStageA(comparisonId);
+export async function startComparison(comparisonId: string, options?: { batchConcurrency?: number }): Promise<void> {
+  return runStageA(comparisonId, options);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

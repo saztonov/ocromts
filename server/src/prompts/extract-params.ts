@@ -163,3 +163,60 @@ export function buildExtractParamsPromptSingle(item: RawItemForExtraction): Extr
     userMessage,
   };
 }
+
+/**
+ * Строит system+user сообщения для извлечения параметров СРАЗУ N позиций в одном LLM-вызове.
+ *
+ * Критично: чтобы модель не перепутала строки между собой, каждая позиция оборачивается
+ * явными маркерами `=== POSITION N ===` / `=== END POSITION N ===`, а в инструкции
+ * жёстко требуется сохранить порядок и точные номера position.
+ *
+ * Ответ должен быть строго `{ "items": [ { position, ... }, ... ] }`,
+ * по одному элементу на каждую входную POSITION, в том же порядке.
+ */
+export function buildExtractParamsPromptBatch(items: RawItemForExtraction[]): ExtractPromptResult {
+  const expectedPositions = items.map((it) => it.position);
+
+  const blocks = items
+    .map((it) => {
+      return [
+        `=== POSITION ${it.position} ===`,
+        `position: ${it.position}`,
+        `name: ${it.rawName}`,
+        `quantity: ${it.quantity}`,
+        `unit: ${it.unit}`,
+        `=== END POSITION ${it.position} ===`,
+      ].join('\n');
+    })
+    .join('\n\n');
+
+  const userMessage = `## Извлечение параметров для пакета из ${items.length} позиций
+
+СТРОГИЕ ПРАВИЛА (нарушение = ошибка):
+1. Верни РОВНО ${items.length} элементов в массиве "items", по одному на каждую входную POSITION.
+2. Поле "position" в каждом ответе ДОЛЖНО точно совпадать с номером входной POSITION. Запрещено объединять, переименовывать, переупорядочивать или пропускать позиции.
+3. Параметры одной POSITION извлекаются ИСКЛЮЧИТЕЛЬНО из её блока (между маркерами === POSITION N === и === END POSITION N ===). Не подсматривай в соседние блоки и не переноси параметры между ними.
+4. Порядок элементов в "items[]" должен СТРОГО соответствовать порядку входных POSITION.
+5. Если в наименовании какой-то позиции параметра нет — НЕ выдумывай, оставь поле отсутствующим. Все 4 группы (geometry/material/standards/extra) обязательны как объекты, могут быть пустыми.
+
+Ожидаемые position (ровно в этом порядке): [${expectedPositions.join(', ')}]
+
+## Позиции
+
+${blocks}
+
+## Формат ответа
+
+Только валидный JSON, без markdown-обёртки:
+
+{
+  "items": [
+    { "position": ${expectedPositions[0]}, "category": "...", "type": "...", "shape": null, "geometry": {}, "material": {}, "standards": {}, "extra": {} }${items.length > 1 ? ',\n    ...' : ''}
+  ]
+}`;
+
+  return {
+    systemPrompt: SYSTEM_PROMPT,
+    userMessage,
+  };
+}

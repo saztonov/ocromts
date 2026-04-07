@@ -22,12 +22,16 @@ export async function createComparison(
   orderFile: File,
   invoiceFile: File,
   name?: string,
+  extractBatchConcurrency?: 1 | 3,
 ): Promise<{ id: string }> {
   const form = new FormData();
   form.append('orderFile', orderFile);
   form.append('invoiceFile', invoiceFile);
   if (name?.trim()) {
     form.append('name', name.trim());
+  }
+  if (extractBatchConcurrency === 1 || extractBatchConcurrency === 3) {
+    form.append('extractBatchConcurrency', String(extractBatchConcurrency));
   }
   return request<{ id: string }>('/comparisons', {
     method: 'POST',

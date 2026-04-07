@@ -4,11 +4,17 @@ import FileDropzone from './FileDropzone';
 import Spinner from '../ui/Spinner';
 
 interface UploadFormProps {
-  onSubmit: (orderFile: File, invoiceFile: File, name?: string) => Promise<void>;
+  onSubmit: (
+    orderFile: File,
+    invoiceFile: File,
+    name?: string,
+    extractBatchConcurrency?: 1 | 3,
+  ) => Promise<void>;
 }
 
 export default function UploadForm({ onSubmit }: UploadFormProps) {
   const [name, setName] = useState('');
+  const [batchConcurrency, setBatchConcurrency] = useState<1 | 3>(3);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -24,7 +30,7 @@ export default function UploadForm({ onSubmit }: UploadFormProps) {
     setSubmitting(true);
     setSubmitError(null);
     try {
-      await onSubmit(order.file, invoice.file, name || undefined);
+      await onSubmit(order.file, invoice.file, name || undefined, batchConcurrency);
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : 'Произошла ошибка');
     } finally {
@@ -86,6 +92,39 @@ export default function UploadForm({ onSubmit }: UploadFormProps) {
             onFileSelect={invoice.handleFileSelect}
             onClear={invoice.clearFile}
           />
+        </div>
+
+        {/* Speed mode */}
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1.5">
+            Скорость распознавания
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setBatchConcurrency(1)}
+              className={`rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                batchConcurrency === 1
+                  ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                  : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <div>Безопасно</div>
+              <div className="text-xs font-normal text-slate-500">1 батч за раз</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setBatchConcurrency(3)}
+              className={`rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                batchConcurrency === 3
+                  ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                  : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <div>Быстро</div>
+              <div className="text-xs font-normal text-slate-500">3 батча параллельно</div>
+            </button>
+          </div>
         </div>
 
         {submitError && (

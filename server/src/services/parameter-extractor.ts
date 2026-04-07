@@ -13,6 +13,7 @@ import { config } from '../config.js';
 import { callOpenRouter } from './llm.js';
 import {
   buildExtractParamsPromptSingle,
+  buildExtractParamsPromptBatch,
   type ExtractedItem,
   type RawItemForExtraction,
 } from '../prompts/extract-params.js';
@@ -29,6 +30,10 @@ export interface ExtractParamsOptions {
   onItemDone?: (item: ExtractedItem) => void | Promise<void>;
   /** Колбэк после неудачной обработки (после всех ретраев). Приходит fallback-объект. */
   onItemFailed?: (item: ExtractedItem, error: Error) => void | Promise<void>;
+  /** Ширина пула параллельных батчей. Если не указано — берётся из config. */
+  batchConcurrency?: number;
+  /** Размер одного батча (сколько позиций идёт в один LLM-вызов). Если не указано — берётся из config. */
+  batchSize?: number;
 }
 
 /**
@@ -95,8 +100,136 @@ export async function extractSingleParameter(
 }
 
 /**
+ * Извлекает параметры для пакета позиций ОДНИМ LLM-вызовом.
+ *
+ * Контракт надёжности: если модель вернула не все позиции / лишние / битый JSON —
+ * для проблемных position выполняется fallback через одиночный extractSingleParameter.
+ * Так батч никогда не валит весь блок — деградирует только проблемная строка.
+ */
+export async function extractParametersBatch(
+  items: RawItemForExtraction[],
+  opts: { comparisonId: string; side: ExtractSide; signal?: AbortSignal; dumpAggregator?: DumpAggregator; batchLabel?: string }
+): Promise<{ items: ExtractedItem[]; ok: boolean[]; errors: (Error | undefined)[] }> {
+  const expected = items.map((it) => it.position);
+  const label = opts.batchLabel ?? `batch_${expected[0]}-${expected[expected.length - 1]}`;
+  const startMs = Date.now();
+
+  const fallbackAll = async (): Promise<{ items: ExtractedItem[]; ok: boolean[]; errors: (Error | undefined)[] }> => {
+    const out: ExtractedItem[] = [];
+    const okArr: boolean[] = [];
+    const errArr: (Error | undefined)[] = [];
+    for (const it of items) {
+      const r = await extractSingleParameter(it, {
+        comparisonId: opts.comparisonId,
+        side: opts.side,
+        signal: opts.signal,
+        dumpName: String(it.position).padStart(3, '0'),
+        dumpAggregator: opts.dumpAggregator,
+      });
+      out.push(r.item);
+      okArr.push(r.ok);
+      errArr.push(r.error);
+    }
+    return { items: out, ok: okArr, errors: errArr };
+  };
+
+  try {
+    const { systemPrompt, userMessage } = buildExtractParamsPromptBatch(items);
+    const llmResponse = await callOpenRouter({
+      model: config.OPENROUTER_MODEL_EXTRACT,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
+      temperature: 0.1,
+      responseFormat: { type: 'json_object' },
+      signal: opts.signal,
+      timeoutMs: config.LLM_EXTRACT_TIMEOUT_MS,
+      dumpContext: opts.dumpAggregator
+        ? undefined
+        : { comparisonId: opts.comparisonId, stage: `stage_a/${opts.side}`, name: label },
+      dumpAggregator: opts.dumpAggregator,
+      // Для агрегатора используем первую позицию как ключ — все айтемы батча всё равно
+      // будут записаны через record(position, 'parsed', ...) ниже.
+      dumpPosition: opts.dumpAggregator ? items[0]?.position : undefined,
+    });
+
+    const parsedArray = parseBatchResponse(llmResponse);
+    if (!parsedArray) {
+      console.warn(`[stage-a] ${opts.comparisonId} ${opts.side} ${label}: batch JSON invalid → fallback per-item`);
+      return await fallbackAll();
+    }
+
+    // Индексируем по position
+    const byPosition = new Map<number, unknown>();
+    for (const raw of parsedArray) {
+      if (raw && typeof raw === 'object' && typeof (raw as { position?: unknown }).position === 'number') {
+        byPosition.set((raw as { position: number }).position, raw);
+      }
+    }
+
+    // Sanity-check: ожидаемое количество и совпадение позиций
+    const allPresent = expected.every((p) => byPosition.has(p));
+    if (!allPresent || parsedArray.length !== expected.length) {
+      console.warn(
+        `[stage-a] ${opts.comparisonId} ${opts.side} ${label}: ожидалось ${expected.length} позиций, получено ${parsedArray.length}, missing=${expected.filter((p) => !byPosition.has(p)).join(',')} → fallback per-item для проблемных`
+      );
+    }
+
+    const out: ExtractedItem[] = [];
+    const okArr: boolean[] = [];
+    const errArr: (Error | undefined)[] = [];
+
+    for (const it of items) {
+      const raw = byPosition.get(it.position);
+      let normalized: ExtractedItem | null = null;
+      if (raw) {
+        try {
+          normalized = normalizeExtractedItem(raw, it.position);
+        } catch {
+          normalized = null;
+        }
+      }
+      if (!normalized) {
+        // fallback на одиночный путь только для этой позиции
+        const r = await extractSingleParameter(it, {
+          comparisonId: opts.comparisonId,
+          side: opts.side,
+          signal: opts.signal,
+          dumpName: String(it.position).padStart(3, '0'),
+          dumpAggregator: opts.dumpAggregator,
+        });
+        out.push(r.item);
+        okArr.push(r.ok);
+        errArr.push(r.error);
+      } else {
+        if (opts.dumpAggregator) opts.dumpAggregator.record(it.position, 'parsed', normalized);
+        out.push(normalized);
+        okArr.push(true);
+        errArr.push(undefined);
+      }
+    }
+
+    const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
+    console.log(
+      `[stage-a] ${opts.comparisonId} ${opts.side} ${label}: ✓ batch ${items.length} items (${elapsed}s)`
+    );
+    return { items: out, ok: okArr, errors: errArr };
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
+    console.warn(
+      `[stage-a] ${opts.comparisonId} ${opts.side} ${label}: ✗ batch failed (${error.message}, ${elapsed}s) → fallback per-item`
+    );
+    return await fallbackAll();
+  }
+}
+
+/**
  * Извлекает параметры для всего списка позиций.
- * Обрабатывает строго последовательно: жди ответ → парсь JSON → onItemDone → следующая.
+ * Бьёт на батчи по EXTRACT_BATCH_SIZE и запускает их через пул шириной EXTRACT_BATCH_CONCURRENCY.
+ * Внутри батча используется один LLM-вызов; при сбое — fallback через extractSingleParameter.
+ * Колбэки onItemDone/onItemFailed вызываются по мере готовности каждой позиции, в порядке батчей.
  */
 export async function extractParameters(
   items: RawItemForExtraction[],
@@ -104,37 +237,77 @@ export async function extractParameters(
 ): Promise<ExtractedItem[]> {
   if (items.length === 0) return [];
 
+  const batchSize = Math.max(1, opts.batchSize ?? config.EXTRACT_BATCH_SIZE);
+  const poolWidth = Math.max(1, opts.batchConcurrency ?? config.EXTRACT_BATCH_CONCURRENCY);
+
+  // Разбиваем на батчи
+  const batches: RawItemForExtraction[][] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    batches.push(items.slice(i, i + batchSize));
+  }
+
   console.log(
-    `[stage-a] ${opts.comparisonId} ${opts.side}: ${items.length} позиций → построчная обработка`
+    `[stage-a] ${opts.comparisonId} ${opts.side}: ${items.length} позиций → ${batches.length} батчей × ${batchSize}, pool=${poolWidth}`
   );
 
-  const results: ExtractedItem[] = [];
+  const results: (ExtractedItem | null)[] = new Array(items.length).fill(null);
+  // Для сохранения порядка onItemDone используем пер-батчевые буферы и индексы.
+  const batchStartIdx: number[] = [];
+  {
+    let acc = 0;
+    for (const b of batches) {
+      batchStartIdx.push(acc);
+      acc += b.length;
+    }
+  }
+
   const startedAt = Date.now();
   const aggregator = createDumpAggregator(opts.comparisonId, `stage_a/${opts.side}`);
 
-  try {
-    for (let i = 0; i < items.length; i++) {
+  // Очередь индексов батчей + пул воркеров
+  let nextBatch = 0;
+  let firstError: Error | null = null;
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      if (firstError) return;
       if (opts.signal?.aborted) {
-        throw new Error('Extraction aborted');
+        firstError = new Error('Extraction aborted');
+        return;
       }
-      const it = items[i]!;
-      console.log(`[stage-a] ${opts.comparisonId} ${opts.side} ${i + 1}/${items.length}: → ${truncate(it.rawName, 80)}`);
-
-      const { item: extracted, ok, error } = await extractSingleParameter(it, {
-        comparisonId: opts.comparisonId,
-        side: opts.side,
-        signal: opts.signal,
-        dumpName: String(it.position).padStart(3, '0'),
-        dumpAggregator: aggregator,
-      });
-
-      results.push(extracted);
-      if (ok) {
-        if (opts.onItemDone) await opts.onItemDone(extracted);
-      } else {
-        if (opts.onItemFailed) await opts.onItemFailed(extracted, error!);
+      const myIdx = nextBatch++;
+      if (myIdx >= batches.length) return;
+      const batch = batches[myIdx]!;
+      const label = `batch_${String(myIdx + 1).padStart(3, '0')}_of_${batches.length}`;
+      try {
+        const { items: outItems, ok, errors } = await extractParametersBatch(batch, {
+          comparisonId: opts.comparisonId,
+          side: opts.side,
+          signal: opts.signal,
+          dumpAggregator: aggregator,
+          batchLabel: label,
+        });
+        // Запись результатов и колбэки — порядок внутри батча сохраняется.
+        const start = batchStartIdx[myIdx]!;
+        for (let j = 0; j < outItems.length; j++) {
+          results[start + j] = outItems[j]!;
+          if (ok[j]) {
+            if (opts.onItemDone) await opts.onItemDone(outItems[j]!);
+          } else if (opts.onItemFailed) {
+            await opts.onItemFailed(outItems[j]!, errors[j] ?? new Error('unknown extract error'));
+          }
+        }
+      } catch (err) {
+        firstError = err instanceof Error ? err : new Error(String(err));
+        return;
       }
     }
+  };
+
+  try {
+    const workers = Array.from({ length: Math.min(poolWidth, batches.length) }, () => worker());
+    await Promise.all(workers);
+    if (firstError) throw firstError;
   } finally {
     aggregator.flush();
   }
@@ -142,10 +315,29 @@ export async function extractParameters(
   const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
   const avg = (Number(elapsed) / items.length).toFixed(2);
   console.log(
-    `[stage-a] ${opts.comparisonId} ${opts.side}: ✓ done (${results.length}/${items.length}, ${elapsed}s avg=${avg}s)`
+    `[stage-a] ${opts.comparisonId} ${opts.side}: ✓ done (${items.length}/${items.length}, wall=${elapsed}s avg/item=${avg}s, batches=${batches.length}, pool=${poolWidth})`
   );
 
-  return results;
+  return results.map((r, i) => r ?? makeFallback(items[i]!.position));
+}
+
+/** Парсит батч-ответ модели. Возвращает массив raw-объектов или null, если JSON битый. */
+function parseBatchResponse(text: string): unknown[] | null {
+  const cleaned = stripMarkdownFences(text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+  if (parsed && typeof parsed === 'object') {
+    const obj = parsed as Record<string, unknown>;
+    if (Array.isArray(obj.items)) return obj.items as unknown[];
+    // Толерантность: модель могла вернуть голый массив
+    if (Array.isArray(parsed)) return parsed as unknown[];
+  }
+  if (Array.isArray(parsed)) return parsed as unknown[];
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

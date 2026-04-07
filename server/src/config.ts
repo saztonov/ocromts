@@ -21,6 +21,9 @@ export interface AppConfig {
   PIPELINE_TIMEOUT_MS: number;
   DEBUG_DUMP_DIR: string;
   DEBUG_DUMP_ENABLED: boolean;
+  EXTRACT_BATCH_SIZE: number;
+  EXTRACT_BATCH_CONCURRENCY: number;
+  EXTRACT_SIDES_PARALLEL: boolean;
 }
 
 export const config: AppConfig = {
@@ -39,4 +42,7 @@ export const config: AppConfig = {
   PIPELINE_TIMEOUT_MS: Number(process.env.PIPELINE_TIMEOUT_MS ?? 30 * 60 * 1000),
   DEBUG_DUMP_DIR: path.resolve(__dirname, '../../', process.env.DEBUG_DUMP_DIR ?? 'debug'),
   DEBUG_DUMP_ENABLED: (process.env.DEBUG_DUMP ?? '1') !== '0',
+  EXTRACT_BATCH_SIZE: Number(process.env.EXTRACT_BATCH_SIZE ?? 10),
+  EXTRACT_BATCH_CONCURRENCY: Number(process.env.EXTRACT_BATCH_CONCURRENCY ?? 3),
+  EXTRACT_SIDES_PARALLEL: (process.env.EXTRACT_SIDES_PARALLEL ?? 'true') !== 'false',
 };

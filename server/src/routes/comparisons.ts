@@ -86,7 +86,11 @@ router.post('/', (req: Request, res: Response): void => {
 
   const orderFile = files.orderFile[0];
   const invoiceFile = files.invoiceFile[0];
-  const name = (req.body as { name?: string }).name ?? null;
+  const body = req.body as { name?: string; extractBatchConcurrency?: string | number };
+  const name = body.name ?? null;
+  // Только два валидных значения: 1 (безопасно) или 3 (быстро). Иначе берётся дефолт из config.
+  const rawBC = Number(body.extractBatchConcurrency);
+  const batchConcurrency = rawBC === 1 || rawBC === 3 ? rawBC : undefined;
 
   // Determine invoice file type
   const invoiceExt = path.extname(invoiceFile.originalname).toLowerCase();
@@ -112,7 +116,7 @@ router.post('/', (req: Request, res: Response): void => {
   `).run(comparisonId, name, orderFile.filename, invoiceFile.filename, invoiceFileType);
 
   // Start async processing (fire and forget)
-  startComparison(comparisonId).catch((err) => {
+  startComparison(comparisonId, { batchConcurrency }).catch((err) => {
     console.error(`[routes] Unhandled error in comparison ${comparisonId}:`, err);
   });
 
