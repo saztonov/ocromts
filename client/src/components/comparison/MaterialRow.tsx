@@ -6,6 +6,7 @@ interface MaterialRowProps {
   result: ComparisonResult;
   orderItem?: OrderItem;
   invoiceItem?: InvoiceItem;
+  invoiceByPosition?: Map<number, InvoiceItem>;
   index: number;
 }
 
@@ -51,15 +52,22 @@ function getParams(item?: OrderItem | InvoiceItem | null): ItemParams | null {
   return raw as ItemParams;
 }
 
-export default function MaterialRow({ result, orderItem, invoiceItem, index }: MaterialRowProps) {
+export default function MaterialRow({ result, orderItem, invoiceItem, invoiceByPosition, index }: MaterialRowProps) {
   const [expanded, setExpanded] = useState(false);
 
   const discrepancies = parseDiscrepancies(result.discrepancies_json);
   const orderParams = getParams(orderItem);
   const invoiceParams = getParams(invoiceItem);
   const hasParams = !!(orderParams || invoiceParams);
+  const split = result.split_json ?? null;
+  const hasComment = !!orderItem?.comment;
   const hasDetails =
-    result.reasoning || discrepancies.length > 0 || result.quantity_status || hasParams;
+    result.reasoning ||
+    discrepancies.length > 0 ||
+    result.quantity_status ||
+    hasParams ||
+    split != null ||
+    hasComment;
 
   return (
     <>
@@ -79,9 +87,28 @@ export default function MaterialRow({ result, orderItem, invoiceItem, index }: M
           {orderItem ? (
             <div>
               <p className="text-sm text-slate-900 line-clamp-2">{orderItem.raw_name}</p>
-              <p className="mt-0.5 text-xs text-slate-500">
-                {orderItem.quantity} {orderItem.unit}
-              </p>
+              <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                <span>
+                  {orderItem.quantity} {orderItem.unit}
+                </span>
+                {hasComment && (
+                  <span
+                    title={orderItem.comment ?? ''}
+                    className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${
+                      orderItem.comment_has_units
+                        ? 'border-amber-200 bg-amber-50 text-amber-700'
+                        : 'border-slate-200 bg-slate-50 text-slate-600'
+                    }`}
+                  >
+                    коммент.
+                  </span>
+                )}
+                {split && split.invoicePositions.length > 1 && (
+                  <span className="inline-flex items-center rounded-full border border-indigo-200 bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">
+                    разбито на {split.invoicePositions.length}
+                  </span>
+                )}
+              </div>
             </div>
           ) : (
             <span className="text-sm text-slate-400">—</span>
@@ -137,6 +164,87 @@ export default function MaterialRow({ result, orderItem, invoiceItem, index }: M
         <tr>
           <td colSpan={4} className="px-4 pb-4">
             <div className="ml-8 rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-4">
+              {/* Comment from order */}
+              {hasComment && orderItem?.comment && (
+                <div>
+                  <h4 className="text-xs font-medium uppercase tracking-wider text-slate-500 mb-1">
+                    Комментарий из заказа
+                  </h4>
+                  <p
+                    className={`text-sm whitespace-pre-line rounded border px-3 py-2 ${
+                      orderItem.comment_has_units
+                        ? 'border-amber-200 bg-amber-50 text-amber-900'
+                        : 'border-slate-200 bg-white text-slate-700'
+                    }`}
+                  >
+                    {orderItem.comment}
+                  </p>
+                </div>
+              )}
+
+              {/* 1→N split by subsystem / group */}
+              {split && (split.invoicePositions.length > 1 || (split.byGroup && split.byGroup.length > 0)) && (
+                <div>
+                  <h4 className="text-xs font-medium uppercase tracking-wider text-slate-500 mb-2">
+                    Разбивка по подсистемам
+                  </h4>
+                  <div className="overflow-hidden rounded-md border border-slate-200 bg-white">
+                    <table className="w-full text-xs">
+                      <thead className="bg-slate-50 text-slate-500">
+                        <tr>
+                          <th className="px-3 py-2 text-left font-medium">Подсистема</th>
+                          <th className="px-3 py-2 text-left font-medium">Кол-во</th>
+                          <th className="px-3 py-2 text-left font-medium">Строка счёта</th>
+                          <th className="px-3 py-2 text-left font-medium">Наименование в счёте</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {(split.byGroup && split.byGroup.length > 0
+                          ? split.byGroup.map((g) => ({
+                              group: g.group,
+                              invoicePosition: g.invoicePosition,
+                              qty: g.qty,
+                            }))
+                          : split.invoicePositions.map((p) => ({
+                              group: null as string | null,
+                              invoicePosition: p,
+                              qty: null as number | null,
+                            }))
+                        ).map((row, i) => {
+                          const inv = invoiceByPosition?.get(row.invoicePosition);
+                          return (
+                            <tr key={`split-${i}`}>
+                              <td className="px-3 py-1.5 font-medium text-slate-700">
+                                {row.group ?? '—'}
+                              </td>
+                              <td className="px-3 py-1.5 text-slate-700">
+                                {row.qty != null
+                                  ? `${row.qty} ${split.invoiceUnit}`
+                                  : inv
+                                  ? `${inv.quantity} ${inv.unit}`
+                                  : '—'}
+                              </td>
+                              <td className="px-3 py-1.5 text-slate-500">№ {row.invoicePosition}</td>
+                              <td className="px-3 py-1.5 text-slate-700">
+                                {inv?.raw_name ?? '—'}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                      <tfoot className="bg-slate-50 text-slate-600">
+                        <tr>
+                          <td className="px-3 py-1.5 font-medium">Итого по счёту</td>
+                          <td className="px-3 py-1.5 font-medium" colSpan={3}>
+                            {split.totalInvoiceQty} {split.invoiceUnit}
+                          </td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                </div>
+              )}
+
               {/* Reasoning */}
               {result.reasoning && (
                 <div>

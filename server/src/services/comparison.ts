@@ -20,6 +20,7 @@ import { extractParameters, extractSingleParameter } from './parameter-extractor
 import type { ExtractedItem, RawItemForExtraction } from '../prompts/extract-params.js';
 import { matchFuzzy } from './fuzzy-matcher.js';
 import { matchLlm, type MatchPair } from './llm-document-comparator.js';
+import { compareQuantities } from './unit-converter.js';
 import { dumpJson } from '../utils/llm-dump.js';
 
 export type ComparisonMethod = 'fuzzy' | 'llm' | 'both';
@@ -45,6 +46,7 @@ interface ComparisonRow {
   stage_a_failed_side: string | null;
   stage_a_error: string | null;
   stage_a_completed_at: string | null;
+  user_prompt: string | null;
 }
 
 // ---- Cancellation infrastructure ---- //
@@ -146,8 +148,8 @@ export async function runStageA(comparisonId: string, options?: { batchConcurren
     checkCancelled(comparisonId);
 
     const insertOrderItem = db.prepare(`
-      INSERT INTO order_items (comparison_id, position, raw_name, quantity, unit)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO order_items (comparison_id, position, raw_name, quantity, unit, comment, comment_has_units)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
     const insertInvoiceItem = db.prepare(`
       INSERT INTO invoice_items (comparison_id, position, raw_name, quantity, unit, unit_price, total_price)
@@ -159,7 +161,15 @@ export async function runStageA(comparisonId: string, options?: { batchConcurren
 
     db.transaction(() => {
       for (const it of orderItems) {
-        const r = insertOrderItem.run(comparisonId, it.position, it.rawName, it.quantity, it.unit);
+        const r = insertOrderItem.run(
+          comparisonId,
+          it.position,
+          it.rawName,
+          it.quantity,
+          it.unit,
+          it.comment ?? null,
+          it.commentHasUnits ? 1 : 0
+        );
         orderPositionToId.set(it.position, Number(r.lastInsertRowid));
       }
       for (const it of invoiceItems) {
@@ -254,18 +264,49 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
     // Зачищаем старые результаты на случай повторного запуска
     db.prepare('DELETE FROM comparison_results WHERE comparison_id = ?').run(comparisonId);
 
+    const comparisonRow = db.prepare('SELECT user_prompt FROM comparisons WHERE id = ?').get(comparisonId) as
+      | { user_prompt: string | null }
+      | undefined;
+    const userPrompt = comparisonRow?.user_prompt ?? null;
+
     const orderRows = db.prepare(
-      'SELECT id, position, raw_name, params_json FROM order_items WHERE comparison_id = ? ORDER BY position'
-    ).all(comparisonId) as Array<{ id: number; position: number; raw_name: string; params_json: string | null }>;
+      'SELECT id, position, raw_name, params_json, quantity, unit, comment, comment_has_units FROM order_items WHERE comparison_id = ? ORDER BY position'
+    ).all(comparisonId) as Array<{
+      id: number;
+      position: number;
+      raw_name: string;
+      params_json: string | null;
+      quantity: number;
+      unit: string;
+      comment: string | null;
+      comment_has_units: number;
+    }>;
     const invoiceRows = db.prepare(
-      'SELECT id, position, raw_name, params_json FROM invoice_items WHERE comparison_id = ? ORDER BY position'
-    ).all(comparisonId) as Array<{ id: number; position: number; raw_name: string; params_json: string | null }>;
+      'SELECT id, position, raw_name, params_json, quantity, unit FROM invoice_items WHERE comparison_id = ? ORDER BY position'
+    ).all(comparisonId) as Array<{
+      id: number;
+      position: number;
+      raw_name: string;
+      params_json: string | null;
+      quantity: number;
+      unit: string;
+    }>;
 
     const orderItems = orderRows.map((r) => parseParamsJson(r.params_json, r.position));
     const invoiceItems = invoiceRows.map((r) => parseParamsJson(r.params_json, r.position));
 
     const orderPosToId = new Map(orderRows.map((r) => [r.position, r.id]));
     const invoicePosToId = new Map(invoiceRows.map((r) => [r.position, r.id]));
+    const orderQtyByPos = new Map(orderRows.map((r) => [r.position, { quantity: r.quantity, unit: r.unit }]));
+    const invoiceQtyByPos = new Map(invoiceRows.map((r) => [r.position, { quantity: r.quantity, unit: r.unit }]));
+
+    // Собираем значимые комментарии (для экономии токенов — только с единицами измерения).
+    const orderComments = new Map<number, string>();
+    for (const r of orderRows) {
+      if (r.comment_has_units && r.comment) {
+        orderComments.set(r.position, r.comment);
+      }
+    }
 
     let fuzzyMatches: MatchPair[] = [];
     let llmMatches: MatchPair[] = [];
@@ -278,7 +319,12 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
 
     if (method === 'llm' || method === 'both') {
       checkCancelled(comparisonId);
-      llmMatches = await matchLlm(orderItems, invoiceItems, { comparisonId, signal: controller.signal });
+      llmMatches = await matchLlm(orderItems, invoiceItems, {
+        comparisonId,
+        signal: controller.signal,
+        userPrompt,
+        orderComments,
+      });
       updateProgress(comparisonId, 'comparing', 88);
     }
 
@@ -296,8 +342,8 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
         comparison_id, order_item_id, invoice_item_id,
         match_status, match_confidence,
         quantity_status, quantity_diff_pct, conversion_note,
-        discrepancies_json, reasoning, method
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        discrepancies_json, reasoning, method, split_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const writeBatch = (matches: MatchPair[], methodTag: string): void => {
@@ -305,8 +351,42 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
       for (const m of matches) {
         const orderItemId = orderPosToId.get(m.orderPosition) ?? null;
         if (m.invoicePosition != null) {
-          const invoiceItemId = invoicePosToId.get(m.invoicePosition) ?? null;
-          if (invoiceItemId != null) usedInvoice.add(invoiceItemId);
+          // Определяем полный список позиций счёта (1:1 → [invoicePosition], 1→N → invoicePositions).
+          const allInvoicePositions = Array.isArray(m.invoicePositions) && m.invoicePositions.length > 0
+            ? m.invoicePositions
+            : [m.invoicePosition];
+          const primaryInvoiceItemId = invoicePosToId.get(m.invoicePosition) ?? null;
+
+          // Помечаем все связанные строки счёта как использованные.
+          for (const pos of allInvoicePositions) {
+            const id = invoicePosToId.get(pos);
+            if (id != null) usedInvoice.add(id);
+          }
+
+          // Сравнение количества (с агрегацией для 1→N).
+          const orderQty = orderQtyByPos.get(m.orderPosition);
+          let totalInvoiceQty = 0;
+          let invoiceUnit = '';
+          let hasQty = false;
+          for (const pos of allInvoicePositions) {
+            const inv = invoiceQtyByPos.get(pos);
+            if (inv) {
+              totalInvoiceQty += inv.quantity;
+              if (!invoiceUnit) invoiceUnit = inv.unit;
+              hasQty = true;
+            }
+          }
+
+          let quantityStatus: string | null = null;
+          let quantityDiffPct: number | null = null;
+          let conversionNote: string | null = null;
+          if (orderQty && hasQty) {
+            const qc = compareQuantities(orderQty.quantity, orderQty.unit, totalInvoiceQty, invoiceUnit);
+            quantityStatus = qc.status;
+            quantityDiffPct = qc.diffPct;
+            conversionNote = qc.note;
+          }
+
           const status = m.decision?.derivedStatus ?? 'matched';
           const discrepancies = m.decision?.mismatches.length
             ? JSON.stringify(m.decision.mismatches.map((mm) => ({
@@ -316,18 +396,30 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
                 severity: mm.severity,
               })))
             : null;
+
+          // Запись о разбивке 1→N: сохраняем полный список позиций счёта и breakdown по подсистемам.
+          let splitJson: string | null = null;
+          if (allInvoicePositions.length > 1 || (m.splitByGroup && m.splitByGroup.length > 0)) {
+            splitJson = JSON.stringify({
+              invoicePositions: allInvoicePositions,
+              totalInvoiceQty,
+              invoiceUnit,
+              byGroup: m.splitByGroup ?? null,
+            });
+          }
+
           insertResult.run(
-            comparisonId, orderItemId, invoiceItemId,
+            comparisonId, orderItemId, primaryInvoiceItemId,
             status, m.confidence,
-            null, null, null,
-            discrepancies, m.reasoning, methodTag
+            quantityStatus, quantityDiffPct, conversionNote,
+            discrepancies, m.reasoning, methodTag, splitJson
           );
         } else {
           insertResult.run(
             comparisonId, orderItemId, null,
             'unmatched_order', null,
             null, null, null,
-            null, m.reasoning, methodTag
+            null, m.reasoning, methodTag, null
           );
         }
       }
@@ -338,7 +430,7 @@ export async function runStageB(comparisonId: string, method: ComparisonMethod):
             comparisonId, null, invRow.id,
             'unmatched_invoice', null,
             null, null, null,
-            null, 'Не найдено соответствие в заказе', methodTag
+            null, 'Не найдено соответствие в заказе', methodTag, null
           );
         }
       }

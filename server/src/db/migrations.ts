@@ -49,11 +49,26 @@ export function runMigrations(): void {
   if (!colNames.has('stage_a_completed_at')) {
     db.exec("ALTER TABLE comparisons ADD COLUMN stage_a_completed_at TEXT");
   }
+  if (!colNames.has('user_prompt')) {
+    db.exec("ALTER TABLE comparisons ADD COLUMN user_prompt TEXT");
+  }
+
+  const orderItemColumns = db.prepare("PRAGMA table_info(order_items)").all() as { name: string }[];
+  const orderItemColNames = new Set(orderItemColumns.map((c) => c.name));
+  if (!orderItemColNames.has('comment')) {
+    db.exec("ALTER TABLE order_items ADD COLUMN comment TEXT");
+  }
+  if (!orderItemColNames.has('comment_has_units')) {
+    db.exec("ALTER TABLE order_items ADD COLUMN comment_has_units INTEGER NOT NULL DEFAULT 0");
+  }
 
   const resultColumns = db.prepare("PRAGMA table_info(comparison_results)").all() as { name: string }[];
   const resultColNames = new Set(resultColumns.map((c) => c.name));
   if (!resultColNames.has('method')) {
     db.exec("ALTER TABLE comparison_results ADD COLUMN method TEXT NOT NULL DEFAULT 'single'");
+  }
+  if (!resultColNames.has('split_json')) {
+    db.exec("ALTER TABLE comparison_results ADD COLUMN split_json TEXT");
   }
 
   // Clean up comparisons stuck in processing state (e.g. server crashed mid-comparison)

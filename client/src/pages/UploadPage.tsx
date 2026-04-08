@@ -19,8 +19,9 @@ export default function UploadPage() {
     invoiceFile: File,
     name?: string,
     extractBatchConcurrency?: 1 | 3,
+    userPrompt?: string,
   ) => {
-    const { id } = await createComparison(orderFile, invoiceFile, name, extractBatchConcurrency);
+    const { id } = await createComparison(orderFile, invoiceFile, name, extractBatchConcurrency, userPrompt);
     await queryClient.invalidateQueries({ queryKey: ['comparisons'] });
     navigate(`/comparisons/${id}`);
   };

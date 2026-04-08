@@ -32,6 +32,14 @@ export default function ComparisonTable({
     return m;
   }, [invoiceItems]);
 
+  const invoiceByPosition = useMemo(() => {
+    const m = new Map<number, InvoiceItem>();
+    for (const item of invoiceItems) {
+      m.set(item.position, item);
+    }
+    return m;
+  }, [invoiceItems]);
+
   const filtered = useMemo(() => {
     if (filter === 'all') return results;
     return results.filter((r) => r.match_status === filter);
@@ -75,6 +83,7 @@ export default function ComparisonTable({
                 result={result}
                 orderItem={result.order_item_id != null ? orderMap.get(result.order_item_id) : undefined}
                 invoiceItem={result.invoice_item_id != null ? invoiceMap.get(result.invoice_item_id) : undefined}
+                invoiceByPosition={invoiceByPosition}
                 index={idx}
               />
             ))}

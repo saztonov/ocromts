@@ -12,6 +12,7 @@ import {
   buildCompareDocumentsPrompt,
   parseCompareDocumentsResponse,
   type DocumentMatch,
+  type DocumentSplitEntry,
 } from '../prompts/compare-documents.js';
 import type { ExtractedItem } from '../prompts/extract-params.js';
 import { compareItems, type CompareDecision } from './parameter-comparator.js';
@@ -20,6 +21,10 @@ import { dumpParsed, dumpJson, type DumpContext } from '../utils/llm-dump.js';
 export interface MatchPair {
   orderPosition: number;
   invoicePosition: number | null;
+  /** Для разбиения 1→N: все позиции счёта, связанные с этой позицией заказа. */
+  invoicePositions?: number[];
+  /** Разбивка по подсистемам из комментария к заказу. */
+  splitByGroup?: DocumentSplitEntry[];
   confidence: number;
   reasoning: string;
   /** Решение детерминированного валидатора, если матч есть. */
@@ -29,6 +34,8 @@ export interface MatchPair {
 export interface MatchLlmOptions {
   comparisonId: string;
   signal?: AbortSignal;
+  userPrompt?: string | null;
+  orderComments?: Map<number, string>;
 }
 
 export async function matchLlm(
@@ -36,7 +43,10 @@ export async function matchLlm(
   invoiceItems: ExtractedItem[],
   opts: MatchLlmOptions
 ): Promise<MatchPair[]> {
-  const { systemPrompt, userMessage } = buildCompareDocumentsPrompt(orderItems, invoiceItems);
+  const { systemPrompt, userMessage } = buildCompareDocumentsPrompt(orderItems, invoiceItems, {
+    userPrompt: opts.userPrompt,
+    orderComments: opts.orderComments,
+  });
 
   const dumpCtx: DumpContext = {
     comparisonId: opts.comparisonId,
@@ -70,22 +80,52 @@ export async function matchLlm(
     `[stage-b:llm] ${opts.comparisonId} ← response (${elapsed}s) — ${parsed.matches.length} matches in raw response`
   );
 
-  // Уникальность invoicePosition: если LLM использовала одну позицию счёта дважды,
-  // оставляем первое вхождение, остальные → unmatched + warning.
+  // Уникальность позиций счёта: каждая invoicePosition может использоваться в одной
+  // orderPosition. Для 1→N берём invoicePositions[] как источник истины.
+  // Если одна позиция счёта всплывает в двух разных orderPosition — оставляем первое.
   const usedInvoice = new Set<number>();
   const dedup: DocumentMatch[] = [];
   for (const m of parsed.matches) {
-    if (m.invoicePosition != null) {
-      if (usedInvoice.has(m.invoicePosition)) {
-        console.warn(
-          `[stage-b:llm] ${opts.comparisonId} dup invoice#${m.invoicePosition} for order#${m.orderPosition} — demoting to unmatched`
-        );
-        dedup.push({ ...m, invoicePosition: null, confidence: 0, reasoning: `${m.reasoning} (дубликат счёта)` });
-        continue;
-      }
-      usedInvoice.add(m.invoicePosition);
+    const positions = Array.isArray(m.invoicePositions) && m.invoicePositions.length > 0
+      ? m.invoicePositions.filter((p): p is number => typeof p === 'number')
+      : (m.invoicePosition != null ? [m.invoicePosition] : []);
+
+    if (positions.length === 0) {
+      dedup.push({ ...m, invoicePosition: null });
+      continue;
     }
-    dedup.push(m);
+
+    const kept: number[] = [];
+    const dropped: number[] = [];
+    for (const p of positions) {
+      if (usedInvoice.has(p)) dropped.push(p);
+      else { kept.push(p); usedInvoice.add(p); }
+    }
+
+    if (kept.length === 0) {
+      console.warn(
+        `[stage-b:llm] ${opts.comparisonId} все позиции счёта дубликаты для order#${m.orderPosition} — unmatched`
+      );
+      dedup.push({ ...m, invoicePosition: null, invoicePositions: undefined, splitByGroup: undefined, confidence: 0, reasoning: `${m.reasoning} (дубликат счёта)` });
+      continue;
+    }
+
+    if (dropped.length > 0) {
+      console.warn(
+        `[stage-b:llm] ${opts.comparisonId} order#${m.orderPosition}: отброшены дубликаты счёта ${dropped.join(',')}`
+      );
+    }
+
+    const filteredSplit = Array.isArray(m.splitByGroup)
+      ? m.splitByGroup.filter((s) => kept.includes(s.invoicePosition))
+      : undefined;
+
+    dedup.push({
+      ...m,
+      invoicePosition: kept[0]!,
+      invoicePositions: kept.length > 1 ? kept : undefined,
+      splitByGroup: filteredSplit && filteredSplit.length > 0 ? filteredSplit : undefined,
+    });
   }
 
   // Гарантия: для каждой orderPosition есть запись (если LLM что-то пропустила).
@@ -121,6 +161,8 @@ export async function matchLlm(
       return {
         orderPosition: m.orderPosition,
         invoicePosition: m.invoicePosition,
+        invoicePositions: m.invoicePositions,
+        splitByGroup: m.splitByGroup,
         confidence: m.confidence,
         reasoning: m.reasoning,
       };
@@ -129,6 +171,8 @@ export async function matchLlm(
     return {
       orderPosition: m.orderPosition,
       invoicePosition: m.invoicePosition,
+      invoicePositions: m.invoicePositions,
+      splitByGroup: m.splitByGroup,
       confidence: decision.confidence,
       reasoning: m.reasoning,
       decision,

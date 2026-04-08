@@ -57,3 +57,56 @@ export function normalizeUnit(raw: string): string {
 export function unitsMatch(unitA: string, unitB: string): boolean {
   return normalizeUnit(unitA) === normalizeUnit(unitB);
 }
+
+/**
+ * Attempts to convert `qty` from `fromUnit` to `toUnit` using deterministic
+ * rules (kg↔t, м²↔100м²). Returns null if units are incompatible.
+ * Same unit — returns qty unchanged.
+ */
+export function convertQty(qty: number, fromUnit: string, toUnit: string): number | null {
+  const a = normalizeUnit(fromUnit);
+  const b = normalizeUnit(toUnit);
+  if (a === b) return qty;
+  if (a === 'кг' && b === 'т') return qty / 1000;
+  if (a === 'т' && b === 'кг') return qty * 1000;
+  if (a === 'м²' && b === '100м²') return qty / 100;
+  if (a === '100м²' && b === 'м²') return qty * 100;
+  return null;
+}
+
+export type QuantityStatus = 'exact' | 'within_tolerance' | 'over' | 'under' | 'incompatible_units';
+
+export interface QuantityComparison {
+  status: QuantityStatus;
+  diffPct: number | null;
+  convertedInvoiceQty: number | null;
+  note: string | null;
+}
+
+/**
+ * Compares an order quantity vs. (already-summed) invoice quantity,
+ * converting units if needed. Returns a status and percent difference.
+ */
+export function compareQuantities(
+  orderQty: number,
+  orderUnit: string,
+  invoiceQty: number,
+  invoiceUnit: string
+): QuantityComparison {
+  const converted = convertQty(invoiceQty, invoiceUnit, orderUnit);
+  if (converted == null) {
+    return { status: 'incompatible_units', diffPct: null, convertedInvoiceQty: null, note: `Несовместимые единицы: ${invoiceUnit} → ${orderUnit}` };
+  }
+  if (orderQty <= 0) {
+    return { status: 'exact', diffPct: 0, convertedInvoiceQty: converted, note: null };
+  }
+  const diffPct = Math.abs(orderQty - converted) / orderQty * 100;
+  const rounded = Math.round(diffPct * 100) / 100;
+  const note = normalizeUnit(invoiceUnit) !== normalizeUnit(orderUnit)
+    ? `${invoiceQty} ${invoiceUnit} = ${converted} ${orderUnit}`
+    : null;
+  if (diffPct === 0) return { status: 'exact', diffPct: 0, convertedInvoiceQty: converted, note };
+  if (diffPct <= 5) return { status: 'within_tolerance', diffPct: rounded, convertedInvoiceQty: converted, note };
+  if (converted > orderQty) return { status: 'over', diffPct: rounded, convertedInvoiceQty: converted, note };
+  return { status: 'under', diffPct: rounded, convertedInvoiceQty: converted, note };
+}

@@ -51,6 +51,7 @@ export interface Comparison {
   stage_a_failed_side: 'order' | 'invoice' | null;
   stage_a_error: string | null;
   stage_a_completed_at: string | null;
+  user_prompt: string | null;
 }
 
 export interface ComparisonSummary {
@@ -73,6 +74,8 @@ export interface OrderItem {
   params_json: ItemParams | null;
   quantity: number;
   unit: string;
+  comment?: string | null;
+  comment_has_units?: number;
 }
 
 export interface InvoiceItem extends OrderItem {
@@ -88,6 +91,19 @@ export interface Discrepancy {
   comment?: string;
 }
 
+export interface SplitEntry {
+  group: string | null;
+  invoicePosition: number;
+  qty: number | null;
+}
+
+export interface SplitInfo {
+  invoicePositions: number[];
+  totalInvoiceQty: number;
+  invoiceUnit: string;
+  byGroup: SplitEntry[] | null;
+}
+
 export interface ComparisonResult {
   id: number;
   comparison_id: string;
@@ -101,6 +117,7 @@ export interface ComparisonResult {
   discrepancies_json: string | null;
   reasoning: string | null;
   method: string;
+  split_json?: SplitInfo | null;
 }
 
 export interface ComparisonDetail {

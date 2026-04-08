@@ -8,6 +8,8 @@ export interface ParsedItem {
   quantity: number;
   unitPrice?: number;
   totalPrice?: number;
+  comment?: string | null;
+  commentHasUnits?: boolean;
 }
 
 /** Keyword groups for header detection (all lowercase). */
@@ -16,6 +18,18 @@ const UNIT_KEYWORDS = ['ед', 'ед.изм', 'единица', 'изм', 'ед.
 const QTY_KEYWORDS = ['кол-во', 'количество', 'объём', 'объем', 'кол.', 'кол', 'к-во'];
 const PRICE_KEYWORDS = ['цена', 'цена за ед'];
 const TOTAL_KEYWORDS = ['сумма', 'итого', 'стоимость', 'всего'];
+const COMMENT_KEYWORDS = ['комментарий', 'примечание', 'примеч', 'коммент'];
+
+/**
+ * Checks whether a comment string contains unit-of-measure mentions
+ * (шт, кг, м, м², компл и т.п.) — a trigger that the comment may carry
+ * a quantity breakdown by subsystem/group.
+ */
+export function hasUnitMentions(comment: string | null | undefined): boolean {
+  if (!comment) return false;
+  const re = /(\bшт\b|штук[иа]?|\bм\.п\.?|\bм²|\bм2\b|\bм³|\bм3\b|\bкг\b|\bт\b|компл|\bуп\b|\bрул\b|\bподд\b|\bл\b)/i;
+  return re.test(comment);
+}
 
 interface ColumnMap {
   nameCol: number;
@@ -23,6 +37,7 @@ interface ColumnMap {
   qtyCol: number;
   priceCol: number | null;
   totalCol: number | null;
+  commentCol: number | null;
   headerRow: number;
 }
 
@@ -48,6 +63,7 @@ function detectColumns(sheet: XLSX.WorkSheet, maxRows: number = 20): ColumnMap |
     let qtyCol = -1;
     let priceCol: number | null = null;
     let totalCol: number | null = null;
+    let commentCol: number | null = null;
 
     for (let c = range.s.c; c <= range.e.c; c++) {
       const cellRef = XLSX.utils.encode_cell({ r, c });
@@ -72,6 +88,9 @@ function detectColumns(sheet: XLSX.WorkSheet, maxRows: number = 20): ColumnMap |
       if (totalCol == null && matchesKeyword(val, TOTAL_KEYWORDS)) {
         totalCol = c;
       }
+      if (commentCol == null && matchesKeyword(val, COMMENT_KEYWORDS)) {
+        commentCol = c;
+      }
     }
 
     // Minimum requirement: name + quantity columns found
@@ -83,7 +102,7 @@ function detectColumns(sheet: XLSX.WorkSheet, maxRows: number = 20): ColumnMap |
           unitCol = nameCol + 1;
         }
       }
-      return { nameCol, unitCol, qtyCol, priceCol, totalCol, headerRow: r };
+      return { nameCol, unitCol, qtyCol, priceCol, totalCol, commentCol, headerRow: r };
     }
   }
 
@@ -141,7 +160,7 @@ export function parseExcel(filePath: string): ParsedItem[] {
     return parseWithoutHeaders(sheet);
   }
 
-  const { nameCol, unitCol, qtyCol, priceCol, totalCol, headerRow } = columns;
+  const { nameCol, unitCol, qtyCol, priceCol, totalCol, commentCol, headerRow } = columns;
   const range = XLSX.utils.decode_range(sheet['!ref'] ?? 'A1');
   const items: ParsedItem[] = [];
   let position = 1;
@@ -158,6 +177,8 @@ export function parseExcel(filePath: string): ParsedItem[] {
     const unit = unitCol !== -1 ? getCellString(sheet, r, unitCol) : '';
     const unitPrice = priceCol != null ? getCellNumber(sheet, r, priceCol) : undefined;
     const totalPrice = totalCol != null ? getCellNumber(sheet, r, totalCol) : undefined;
+    const commentRaw = commentCol != null ? getCellString(sheet, r, commentCol).trim() : '';
+    const comment = commentRaw.length > 0 ? commentRaw : null;
 
     items.push({
       position: position++,
@@ -166,6 +187,8 @@ export function parseExcel(filePath: string): ParsedItem[] {
       quantity,
       unitPrice,
       totalPrice,
+      comment,
+      commentHasUnits: hasUnitMentions(comment),
     });
   }
 

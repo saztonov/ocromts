@@ -23,6 +23,7 @@ export async function createComparison(
   invoiceFile: File,
   name?: string,
   extractBatchConcurrency?: 1 | 3,
+  userPrompt?: string,
 ): Promise<{ id: string }> {
   const form = new FormData();
   form.append('orderFile', orderFile);
@@ -32,6 +33,9 @@ export async function createComparison(
   }
   if (extractBatchConcurrency === 1 || extractBatchConcurrency === 3) {
     form.append('extractBatchConcurrency', String(extractBatchConcurrency));
+  }
+  if (userPrompt?.trim()) {
+    form.append('user_prompt', userPrompt.trim());
   }
   return request<{ id: string }>('/comparisons', {
     method: 'POST',

@@ -9,11 +9,13 @@ interface UploadFormProps {
     invoiceFile: File,
     name?: string,
     extractBatchConcurrency?: 1 | 3,
+    userPrompt?: string,
   ) => Promise<void>;
 }
 
 export default function UploadForm({ onSubmit }: UploadFormProps) {
   const [name, setName] = useState('');
+  const [userPrompt, setUserPrompt] = useState('');
   const [batchConcurrency, setBatchConcurrency] = useState<1 | 3>(3);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -30,7 +32,7 @@ export default function UploadForm({ onSubmit }: UploadFormProps) {
     setSubmitting(true);
     setSubmitError(null);
     try {
-      await onSubmit(order.file, invoice.file, name || undefined, batchConcurrency);
+      await onSubmit(order.file, invoice.file, name || undefined, batchConcurrency, userPrompt || undefined);
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : 'Произошла ошибка');
     } finally {
@@ -63,6 +65,21 @@ export default function UploadForm({ onSubmit }: UploadFormProps) {
             onChange={(e) => setName(e.target.value)}
             placeholder="Например: Заказ #1234 от ООО Стройснаб"
             className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 transition-colors duration-150 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-0"
+          />
+        </div>
+
+        {/* User prompt */}
+        <div>
+          <label htmlFor="comparison-user-prompt" className="block text-sm font-medium text-slate-700 mb-1.5">
+            Уточнения для анализа <span className="text-slate-400 font-normal">(необязательно)</span>
+          </label>
+          <textarea
+            id="comparison-user-prompt"
+            value={userPrompt}
+            onChange={(e) => setUserPrompt(e.target.value)}
+            rows={3}
+            placeholder="Например: в комментариях к позициям — разбивка по подсистемам (В7.5, В7.6); одной позиции заказа могут соответствовать несколько строк счёта"
+            className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 transition-colors duration-150 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-0 resize-y"
           />
         </div>
 

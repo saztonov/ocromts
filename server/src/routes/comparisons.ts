@@ -18,6 +18,7 @@ interface ComparisonRow {
   error_message: string | null;
   created_at: string;
   summary_json: string | null;
+  user_prompt: string | null;
 }
 
 interface OrderItemRow {
@@ -30,6 +31,8 @@ interface OrderItemRow {
   params_json: string | null;
   quantity: number;
   unit: string;
+  comment: string | null;
+  comment_has_units: number;
 }
 
 interface InvoiceItemRow {
@@ -58,6 +61,8 @@ interface ComparisonResultRow {
   conversion_note: string | null;
   discrepancies_json: string | null;
   reasoning: string | null;
+  method?: string;
+  split_json: string | null;
 }
 
 // ---- Multer file type ---- //
@@ -87,11 +92,13 @@ router.post('/', (req: Request, res: Response): void => {
 
   const orderFile = files.orderFile[0];
   const invoiceFile = files.invoiceFile[0];
-  const body = req.body as { name?: string; extractBatchConcurrency?: string | number };
+  const body = req.body as { name?: string; extractBatchConcurrency?: string | number; user_prompt?: string; userPrompt?: string };
   const name = body.name ?? null;
   // Только два валидных значения: 1 (безопасно) или 3 (быстро). Иначе берётся дефолт из config.
   const rawBC = Number(body.extractBatchConcurrency);
   const batchConcurrency = rawBC === 1 || rawBC === 3 ? rawBC : undefined;
+  const userPromptRaw = (body.user_prompt ?? body.userPrompt ?? '').toString().trim();
+  const userPrompt = userPromptRaw.length > 0 ? userPromptRaw : null;
 
   // Determine invoice file type
   const invoiceExt = path.extname(invoiceFile.originalname).toLowerCase();
@@ -112,9 +119,9 @@ router.post('/', (req: Request, res: Response): void => {
 
   const db = getDb();
   db.prepare(`
-    INSERT INTO comparisons (id, name, order_filename, invoice_filename, invoice_file_type, status)
-    VALUES (?, ?, ?, ?, ?, 'pending')
-  `).run(comparisonId, name, orderFile.filename, invoiceFile.filename, invoiceFileType);
+    INSERT INTO comparisons (id, name, order_filename, invoice_filename, invoice_file_type, status, user_prompt)
+    VALUES (?, ?, ?, ?, ?, 'pending', ?)
+  `).run(comparisonId, name, orderFile.filename, invoiceFile.filename, invoiceFileType, userPrompt);
 
   // Start async processing (fire and forget)
   startComparison(comparisonId, { batchConcurrency }).catch((err) => {
@@ -190,6 +197,7 @@ router.get('/:id', (req: Request, res: Response): void => {
     discrepancies_json: result.discrepancies_json
       ? JSON.parse(result.discrepancies_json)
       : null,
+    split_json: result.split_json ? JSON.parse(result.split_json) : null,
   }));
 
   res.json({
@@ -397,11 +405,20 @@ router.get('/:id/export', (req: Request, res: Response): void => {
 
   const header = [
     '#',
-    'Поз. заказа', 'Наименование (заказ)', 'Кол-во заказ', 'Ед. заказ',
+    'Поз. заказа', 'Наименование (заказ)', 'Кол-во заказ', 'Ед. заказ', 'Комментарий заказа',
     'Поз. счёта', 'Наименование (счёт)', 'Кол-во счёт', 'Ед. счёт', 'Цена', 'Сумма',
     'Статус', 'Кол-во статус', 'Δ %', 'Confidence %', 'Метод',
+    'Разбивка по подсистемам',
     'Расхождения', 'Комментарий модели', 'Конвертация ед.',
   ];
+
+  interface SplitJsonShape {
+    invoicePositions?: number[];
+    totalInvoiceQty?: number;
+    invoiceUnit?: string;
+    byGroup?: Array<{ group: string | null; invoicePosition: number; qty: number | null }> | null;
+  }
+
   const dataRows: (string | number | null)[][] = sorted.map((r, idx) => {
     const o = r.order_item_id ? orderById.get(r.order_item_id) : undefined;
     const inv = r.invoice_item_id ? invoiceById.get(r.invoice_item_id) : undefined;
@@ -426,9 +443,25 @@ router.get('/:id/export', (req: Request, res: Response): void => {
       })
       .join('\n');
 
+    let splitText = '';
+    if (r.split_json) {
+      try {
+        const sp = JSON.parse(r.split_json) as SplitJsonShape;
+        if (sp.byGroup && sp.byGroup.length > 0) {
+          splitText = sp.byGroup
+            .map((g) => `${g.group ?? '—'}: ${g.qty ?? '—'} ${sp.invoiceUnit ?? ''} (поз. ${g.invoicePosition})`)
+            .join('\n');
+        } else if (sp.invoicePositions && sp.invoicePositions.length > 1) {
+          splitText = `строки счёта: ${sp.invoicePositions.join(', ')}; всего ${sp.totalInvoiceQty ?? '—'} ${sp.invoiceUnit ?? ''}`;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     return [
       idx + 1,
-      o?.position ?? null, o?.raw_name ?? '', o?.quantity ?? null, o?.unit ?? '',
+      o?.position ?? null, o?.raw_name ?? '', o?.quantity ?? null, o?.unit ?? '', o?.comment ?? '',
       inv?.position ?? null, inv?.raw_name ?? '', inv?.quantity ?? null, inv?.unit ?? '',
       inv?.unit_price ?? null, inv?.total_price ?? null,
       statusLabel[r.match_status] ?? r.match_status,
@@ -436,6 +469,7 @@ router.get('/:id/export', (req: Request, res: Response): void => {
       r.quantity_diff_pct ?? null,
       r.match_confidence != null ? Math.round(r.match_confidence * 100) : null,
       (r as ComparisonResultRow & { method?: string }).method ?? '',
+      splitText,
       discrText,
       r.reasoning ?? '',
       r.conversion_note ?? '',
@@ -445,15 +479,16 @@ router.get('/:id/export', (req: Request, res: Response): void => {
   const wsResults = XLSX.utils.aoa_to_sheet([header, ...dataRows]);
   wsResults['!cols'] = [
     { wch: 5 },
-    { wch: 8 }, { wch: 50 }, { wch: 11 }, { wch: 8 },
+    { wch: 8 }, { wch: 50 }, { wch: 11 }, { wch: 8 }, { wch: 30 },
     { wch: 8 }, { wch: 50 }, { wch: 11 }, { wch: 8 }, { wch: 11 }, { wch: 12 },
     { wch: 16 }, { wch: 16 }, { wch: 8 }, { wch: 13 }, { wch: 8 },
+    { wch: 40 },
     { wch: 60 }, { wch: 60 }, { wch: 30 },
   ];
-  // Включить перенос строк для текстовых колонок
+  // Включить перенос строк для текстовых колонок: комментарий заказа (5), разбивка (17), расхождения (18), reasoning (19), конвертация (20)
   const range = XLSX.utils.decode_range(wsResults['!ref'] ?? 'A1');
   for (let R = 1; R <= range.e.r; R++) {
-    for (const C of [16, 17, 18]) {
+    for (const C of [5, 17, 18, 19, 20]) {
       const cell = wsResults[XLSX.utils.encode_cell({ r: R, c: C })];
       if (cell) cell.s = { alignment: { wrapText: true, vertical: 'top' } };
     }

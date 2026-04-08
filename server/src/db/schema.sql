@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS comparisons (
     stage_a_failed_position INTEGER,
     stage_a_failed_side TEXT,
     stage_a_error TEXT,
-    stage_a_completed_at TEXT
+    stage_a_completed_at TEXT,
+    user_prompt TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -28,7 +29,9 @@ CREATE TABLE IF NOT EXISTS order_items (
     gost TEXT,
     params_json TEXT,
     quantity REAL NOT NULL,
-    unit TEXT NOT NULL
+    unit TEXT NOT NULL,
+    comment TEXT,
+    comment_has_units INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS invoice_items (
@@ -57,5 +60,6 @@ CREATE TABLE IF NOT EXISTS comparison_results (
     conversion_note TEXT,
     discrepancies_json TEXT,
     reasoning TEXT,
-    method TEXT NOT NULL DEFAULT 'single'
+    method TEXT NOT NULL DEFAULT 'single',
+    split_json TEXT
 );
