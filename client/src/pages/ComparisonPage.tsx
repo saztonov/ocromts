@@ -62,6 +62,7 @@ export default function ComparisonPage() {
   const [chosenMethod, setChosenMethod] = useState<ComparisonMethod>('llm');
   const [isStartingCompare, setIsStartingCompare] = useState(false);
   const [retrying, setRetrying] = useState<string | null>(null);
+  const [retryingAll, setRetryingAll] = useState(false);
 
   const handleStartCompare = async () => {
     if (!id) return;
@@ -88,6 +89,32 @@ export default function ComparisonPage() {
       alert(e instanceof Error ? e.message : String(e));
     } finally {
       setRetrying(null);
+    }
+  };
+
+  const handleRetryAll = async () => {
+    if (!id) return;
+    setRetryingAll(true);
+    try {
+      const failed: Array<{ side: 'order' | 'invoice'; position: number }> = [];
+      for (const it of orderItems) {
+        if (it.params_json?.category === 'other' ||
+            (comparison?.stage_a_failed_side === 'order' && comparison.stage_a_failed_position === it.position)) {
+          failed.push({ side: 'order', position: it.position });
+        }
+      }
+      for (const it of invoiceItems) {
+        if (it.params_json?.category === 'other' ||
+            (comparison?.stage_a_failed_side === 'invoice' && comparison.stage_a_failed_position === it.position)) {
+          failed.push({ side: 'invoice', position: it.position });
+        }
+      }
+      await Promise.all(failed.map(f => retryStageAItem(id, f.side, f.position)));
+      queryClient.invalidateQueries({ queryKey: ['comparison', id] });
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetryingAll(false);
     }
   };
 
@@ -298,6 +325,8 @@ export default function ComparisonPage() {
                 failedPosition={comparison.stage_a_failed_side === 'order' ? comparison.stage_a_failed_position : null}
                 onRetry={handleRetry}
                 retryingKey={retrying}
+                retryingAll={retryingAll}
+                onRetryAll={handleRetryAll}
               />
               <StageALiveTable
                 title={`Счёт (${invoiceItems.length})`}
@@ -306,6 +335,8 @@ export default function ComparisonPage() {
                 failedPosition={comparison.stage_a_failed_side === 'invoice' ? comparison.stage_a_failed_position : null}
                 onRetry={handleRetry}
                 retryingKey={retrying}
+                retryingAll={retryingAll}
+                onRetryAll={handleRetryAll}
               />
             </div>
           )}
@@ -396,13 +427,25 @@ interface StageALiveTableProps {
   failedPosition: number | null;
   onRetry: (side: 'order' | 'invoice', position: number) => void;
   retryingKey: string | null;
+  retryingAll: boolean;
+  onRetryAll: () => void;
 }
 
-function StageALiveTable({ title, items, side, failedPosition, onRetry, retryingKey }: StageALiveTableProps) {
+function StageALiveTable({ title, items, side, failedPosition, onRetry, retryingKey, retryingAll, onRetryAll }: StageALiveTableProps) {
+  const hasFailed = items.some(it => it.params_json?.category === 'other' || failedPosition === it.position);
   return (
     <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-      <div className="px-4 py-3 border-b border-slate-200 bg-slate-50">
+      <div className="px-4 py-3 border-b border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
         <h3 className="text-sm font-semibold text-slate-900">{title}</h3>
+        {hasFailed && (
+          <button
+            onClick={onRetryAll}
+            disabled={retryingAll}
+            className="text-xs px-2 py-1 rounded border border-red-300 text-red-700 hover:bg-red-100 disabled:opacity-50"
+          >
+            {retryingAll ? 'Повтор...' : 'Повторить все'}
+          </button>
+        )}
       </div>
       <div className="max-h-[480px] overflow-y-auto">
         <table className="min-w-full text-xs">
@@ -439,10 +482,10 @@ function StageALiveTable({ title, items, side, failedPosition, onRetry, retrying
                     {isFailed && (
                       <button
                         onClick={() => onRetry(side, it.position)}
-                        disabled={retryingKey === key}
+                        disabled={retryingKey === key || retryingAll}
                         className="text-xs px-2 py-1 rounded border border-red-300 text-red-700 hover:bg-red-100 disabled:opacity-50"
                       >
-                        {retryingKey === key ? '...' : 'Повторить'}
+                        {retryingKey === key || retryingAll ? '...' : 'Повторить'}
                       </button>
                     )}
                   </td>
