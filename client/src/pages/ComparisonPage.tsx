@@ -409,6 +409,7 @@ export default function ComparisonPage() {
                 orderItems={orderItems}
                 invoiceItems={invoiceItems}
                 filter={filter}
+                comparisonMethod={comparison.comparison_method}
               />
             </>
           )}
